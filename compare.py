@@ -59,7 +59,7 @@ except Exception:
     log = _FallbackLogger()
 
 try:
-    from basic.utils.io import glob_single_files
+    from utils.io import glob_single_files
 except Exception:
     from PIL import Image  # noqa: F401
 
@@ -410,6 +410,8 @@ class InteractiveCropComparator:
         self._register_keybindings()
         self._pre_drag_state = None
         self._pre_drag_snapshot = None
+        self.needs_update = True
+        self._idle_return_mode = 'selection'
         # dataset/group tracking
         self.group = current_group
         self.dataset = current_dataset
@@ -453,7 +455,7 @@ class InteractiveCropComparator:
         self.active_roi = active
         self.mode = mode
         self.selection_start = None
-        self.update_display()
+        self.request_update()
 
     def _record_state_change(self, before, after, restore_fn, desc):
         self.undo_manager.record(
@@ -484,18 +486,18 @@ class InteractiveCropComparator:
     # ---- State setters ----
     def _set_frame(self, idx):
         self.current_frame = max(0, min(self.num_frames - 1, idx))
-        self.update_display()
+        self.request_update()
 
     def _set_layout(self, mode):
         self.layout_mode = mode
-        self.update_display()
+        self.request_update()
 
     # ---- Key binding setup ----
     def _register_keybindings(self):
         self.dispatcher.register(ord('n'), self._cmd_next_frame)
         self.dispatcher.register(ord('p'), self._cmd_prev_frame)
         self.dispatcher.register(ord('a'), self._cmd_add_roi)
-        self.dispatcher.register(ord('r'), self._cmd_idle_mode)
+        self.dispatcher.register(ord('i'), self._cmd_idle_mode)
         self.dispatcher.register(ord('s'), self._cmd_save)
         self.dispatcher.register(ord('z'), self._cmd_undo)
         self.dispatcher.register(ord('y'), self._cmd_redo)
@@ -537,7 +539,7 @@ class InteractiveCropComparator:
         before = self._snapshot_rois()
         self.add_roi()
         self._record_rois_change("add roi", before=before)
-        self.update_display()
+        self.request_update()
 
     def _cmd_delete_roi(self):
         if self.active_roi is None or self.active_roi not in self.rois:
@@ -550,7 +552,7 @@ class InteractiveCropComparator:
         if not self.rois:
             self.mode = 'idle'
         self._record_rois_change(f"delete roi {rid}", before=before)
-        self.update_display()
+        self.request_update()
 
     def _cmd_duplicate_roi(self):
         if self.active_roi is None or self.rois.get(self.active_roi, {}).get('rect') is None:
@@ -560,18 +562,25 @@ class InteractiveCropComparator:
         src_rect = self.rois[self.active_roi]['rect']
         new_id = self.add_roi()
         self.rois[new_id]['rect'] = src_rect
-        log.success(f"Added ROI {log.style_num(str(new_id))} with active size")
+        log.success(f"Added ROI {log.style_num(str(new_id))} with the same size as ROI {log.style_num(str(self.active_roi))}")
         self.set_active_roi(new_id, to_selection=False)
         self._record_rois_change("duplicate roi", before=before)
-        self.update_display()
+        self.request_update()
 
     def _cmd_idle_mode(self):
         before = self._snapshot_rois()
-        self.mode = 'idle'
-        self.active_roi = None
-        self.selection_start = None
-        self._record_rois_change("idle mode", before=before)
-        self.update_display()
+        if self.mode != 'idle':
+            self._idle_return_mode = self.mode or self._idle_return_mode
+            self.mode = 'idle'
+            self.active_roi = None
+            self.selection_start = None
+            desc = "enter idle mode"
+        else:
+            restore_mode = self._idle_return_mode or 'selection'
+            self.mode = restore_mode
+            desc = f"exit idle -> {restore_mode}"
+        self._record_rois_change(desc, before=before)
+        self.request_update()
 
     def _cmd_save(self):
         self.save_session_ts = None  # new session per save trigger
@@ -581,13 +590,16 @@ class InteractiveCropComparator:
     def _cmd_digit_roi(self, roi_id):
         before = self._snapshot_rois()
         if roi_id in self.rois:
-            self.set_active_roi(roi_id, to_selection=self.mode != 'selection')
+            if self.active_roi == roi_id:
+                self.set_active_roi(roi_id, to_selection=self.mode != 'selection')
+            else:
+                self.set_active_roi(roi_id, to_selection=False)
             desc = f"select roi {roi_id}"
         else:
             self.add_roi(roi_id=roi_id)
             desc = f"add roi {roi_id}"
         self._record_rois_change(desc, before=before)
-        self.update_display()
+        self.request_update()
 
     def _cmd_shift_digit(self, target_id):
         if self.active_roi is None or self.rois.get(self.active_roi, {}).get('rect') is None:
@@ -614,7 +626,7 @@ class InteractiveCropComparator:
             log.success(f"Copied size to ROI {log.style_num(str(target_id))}")
         self.set_active_roi(target_id, to_selection=False)
         self._record_rois_change(f"shift duplicate {self.active_roi}->{target_id}", before=before)
-        self.update_display()
+        self.request_update()
 
     def _cmd_layout(self, mode):
         if mode == self.layout_mode:
@@ -630,7 +642,7 @@ class InteractiveCropComparator:
             log.warn("Nothing to undo" if desc is None else f"Undo failed: {desc}")
         else:
             log.info(f"Undid: {desc or 'last action'}")
-            self.update_display()
+            self.request_update()
 
     def _cmd_redo(self):
         ok, desc = self.undo_manager.redo()
@@ -638,24 +650,28 @@ class InteractiveCropComparator:
             log.warn("Nothing to redo" if desc is None else f"Redo failed: {desc}")
         else:
             log.info(f"Redid: {desc or 'last action'}")
-            self.update_display()
+            self.request_update()
 
     # ---- Small helpers ----
     def _set_mode(self, mode):
         self.mode = mode
-        self.update_display()
+        self.request_update()
 
     def _restore_active(self, active_id, mode):
         self.active_roi = active_id
         self.mode = mode
         self.selection_start = None
-        self.update_display()
+        self.request_update()
 
     def _restore_roi_rect(self, rid, rect):
         if rid not in self.rois:
             return
         self.rois[rid]['rect'] = rect
-        self.update_display()
+        self.request_update()
+
+    def request_update(self):
+        """Mark UI as dirty; main loop will repaint."""
+        self.needs_update = True
 
     def color_for_id(self, roi_id):
         if not self.palette:
@@ -845,6 +861,7 @@ class InteractiveCropComparator:
         self.active_roi = roi_id
         self.mode = 'selection' if to_selection else 'position'
         self.selection_start = None
+        self.request_update()
 
     def on_mouse(self, event, x, y, flags, param):
         if self.active_roi is None:
@@ -882,7 +899,7 @@ class InteractiveCropComparator:
                 x2 = x1 + w
                 y2 = y1 + h
                 roi['rect'] = (x1, y1, x2, y2)
-            self.update_display()
+            self.request_update()
         elif event == cv2.EVENT_LBUTTONUP:
             self.dragging = False
             prev_state = self._pre_drag_state
@@ -907,7 +924,7 @@ class InteractiveCropComparator:
                 if rid == self.active_roi and old_rect != new_rect and self._pre_drag_snapshot is not None:
                     self._record_rois_change("move/resize roi", before=self._pre_drag_snapshot)
             self._pre_drag_snapshot = None
-            self.update_display()
+            self.request_update()
 
     def read_frame(self, key, idx):
         files = self.image_files[key]
@@ -1234,6 +1251,7 @@ class InteractiveCropComparator:
             else:
                 # Final preview image size is not affected by scale
                 cv2.imshow(self.window_final, final)
+        self.needs_update = False
 
     def save(self, pair, dataset):
         # Prepare timestamped output directory: output/<timestamp>/<dataset>/
@@ -1316,7 +1334,7 @@ class InteractiveCropComparator:
             "Other: "
             + f"{log.style_key('n')}/{log.style_key('p')} next/prev image, "
             + f"{log.style_key('s')} save outputs, "
-            + f"{log.style_key('r')} idle mode, "
+            + f"{log.style_key('i')} idle toggle, "
             + f"{log.style_key('z')} undo, "
             + f"{log.style_key('y')} redo, "
             + f"{log.style_key('Enter')} switch dataset/group, "
@@ -1326,10 +1344,17 @@ class InteractiveCropComparator:
         # Default: enter ROI 1 selection mode at startup
         if len(self.rois) == 0:
             self.add_roi()
-        self.update_display()
+        self.request_update()
 
         while True:
-            key = cv2.waitKey(10) & 0xFF
+            if self.needs_update:
+                self.update_display()
+            key = cv2.waitKeyEx(10)
+            if key in (2490368, 2621440, 2424832, 2555904):  # ↑ ↓ ← →
+                arrow_map = {2424832: 81, 2490368: 82, 2555904: 83, 2621440: 84}
+                key = arrow_map[key]
+            else:
+                key = key & 0xFF if key >= 0 else key
             handled = self.dispatcher.dispatch(key)
             if handled:
                 continue
@@ -1355,7 +1380,7 @@ class InteractiveCropComparator:
                         log.error("Group or dataset is empty; aborted switch")
                     else:
                         if self.rebuild_dataset(ng, nd):
-                            self.update_display()
+                            self.request_update()
                 else:
                     log.info("Dataset switch cancelled (empty input)")
             elif key == 32:
@@ -1366,7 +1391,7 @@ class InteractiveCropComparator:
                     text = ""
                 if text:
                     if self.jump_to_image_by_name(text):
-                        self.update_display()
+                        self.request_update()
                 else:
                     log.info("Image jump cancelled (empty input)")
 
@@ -1381,7 +1406,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', choices=['local', 'external'], default='local', type=str,
                         help='Data source: local uses the workspace structure under --root; external uses /data/xr paths with --pair videos.')
-    parser.add_argument('--root', '-r', default='/mnt/yzc/Results/LLIE-results', type=str,
+    parser.add_argument('--root', '-r', default='./examples', type=str,
                         help='Workspace root containing method folders (local mode only). Example: /mnt/yzc/Results/LLIE-results')
     parser.add_argument('--group', '-g', default='SDSD-indoor+', type=str,
                         help='Dataset group folder under each method (e.g., LOLv2-real+, SDSD-indoor+). Hyphens are auto-resolved across methods.')
