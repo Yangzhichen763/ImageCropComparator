@@ -7,7 +7,7 @@ An interactive, keyboard-driven tool to compare and compose crops from multiple 
 - **Multi-ROI management:** numeric keys `1–9` select/add ROI by ID; `Shift+1–9` selects in selection mode; `a` adds the smallest unused ID.
 - **Per-ROI method grids:** preview the same crop across all methods in a tiled grid.
 - **Final layout preview:** compose single or multiple crops with strict layout rules (`left`, `right`, `up`, `bottom`); change at runtime via arrow keys.
-  - Layout now respects ROI spatial order: `left/right` stack crops from top to bottom; `up/bottom` stack crops from left to right.
+  - Configurable ordering: sort by ROI position (default) or by ROI id, with optional reverse stacking. For position mode, `left/right` stack top→bottom and `up/bottom` stack left→right.
   - Configurable padding between crops and between the crops block and the base image.
   - Display overlay thickness multiplier for the final layout (default ×2).
 - **Active ROI spotlight:** active ROI id is circled on the reference view for clarity.
@@ -212,7 +212,8 @@ python compare.py \
 - `Space`: jump to an image by name (stem or filename); logs if missing.
 - `n` / `p`: next / previous image.
 - `s`: save outputs.
-- `r`: enter idle mode (hide grids).
+- `i`: idle toggle (hide/show grids).
+- `r`: clear all ROIs.
 - `q` or `Esc`: quit.
 
 ## 💾 Saving Structure

@@ -403,6 +403,8 @@ class InteractiveCropComparator:
         self.cached_images = None
         self.grid_windows = set()
         self.layout_mode = 'right'  # 'left' | 'up' | 'right' | 'bottom'
+        self.sort_mode = 'position'  # 'position' | 'id'
+        self.sort_reverse = False
         self.preview_key = reference_key
         self.save_session_ts = None
         self.undo_manager = UndoManager()
@@ -498,6 +500,7 @@ class InteractiveCropComparator:
         self.dispatcher.register(ord('p'), self._cmd_prev_frame)
         self.dispatcher.register(ord('a'), self._cmd_add_roi)
         self.dispatcher.register(ord('i'), self._cmd_idle_mode)
+        self.dispatcher.register(ord('r'), self._cmd_clear_rois)
         self.dispatcher.register(ord('s'), self._cmd_save)
         self.dispatcher.register(ord('z'), self._cmd_undo)
         self.dispatcher.register(ord('y'), self._cmd_redo)
@@ -552,6 +555,18 @@ class InteractiveCropComparator:
         if not self.rois:
             self.mode = 'idle'
         self._record_rois_change(f"delete roi {rid}", before=before)
+        self.request_update()
+
+    def _cmd_clear_rois(self):
+        if not self.rois:
+            return
+        before = self._snapshot_rois()
+        self.rois = {}
+        self.active_roi = None
+        self.selection_start = None
+        self.mode = 'selection'
+        self._record_rois_change("clear all rois", before=before)
+        self.add_roi()
         self.request_update()
 
     def _cmd_duplicate_roi(self):
@@ -1005,18 +1020,27 @@ class InteractiveCropComparator:
                 y += gap
         return out
 
-    def build_final_layout_for_key(self, key):
+    def build_final_layout_for_key(self, key, sort_mode=None, reverse_sort=False):
         ref = self.read_frame(key, self.current_frame)
         if ref is None:
             return None
         H, W = ref.shape[:2]
         valid = [(rid, r) for rid, r in sorted(self.rois.items()) if r['rect'] is not None]
-        # Order ROIs by their spatial position instead of id: vertical for left/right, horizontal for up/bottom
+        # Determine sorting strategy
+        eff_sort_mode = (sort_mode or self.sort_mode).lower()
+        eff_reverse = bool(reverse_sort or self.sort_reverse)
+        # Order ROIs either by spatial position (default) or by id
         if len(valid) > 1:
-            if self.layout_mode in ['left', 'right']:
-                valid.sort(key=lambda item: ((item[1]['rect'][1] + item[1]['rect'][3]) / 2.0))
+            if eff_sort_mode == 'id':
+                valid.sort(key=lambda item: item[0], reverse=eff_reverse)
+            elif eff_sort_mode == 'position':  # position-based
+                if self.layout_mode in ['left', 'right']:
+                    valid.sort(key=lambda item: ((item[1]['rect'][1] + item[1]['rect'][3]) / 2.0), reverse=eff_reverse)
+                else:
+                    valid.sort(key=lambda item: ((item[1]['rect'][0] + item[1]['rect'][2]) / 2.0), reverse=eff_reverse)
             else:
-                valid.sort(key=lambda item: ((item[1]['rect'][0] + item[1]['rect'][2]) / 2.0))
+                log.warn(f"Unknown sort mode: {eff_sort_mode}; defaulting to id")
+                valid.sort(key=lambda item: item[0], reverse=eff_reverse)
         if len(valid) == 0:
             return None
         block_line_th = max(1, int(round(self.line_thickness * self.layout_border_scale)))
@@ -1211,6 +1235,10 @@ class InteractiveCropComparator:
             pass
         cv2.imshow(self.window_main, canvas)
 
+        def final_layout_blank():
+            blank = np.zeros((min(240, self.height), min(320, self.width), 3), dtype=np.uint8)
+            cv2.putText(blank, "Final layout idle", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            return blank
         if self.mode == 'idle':
             for w in list(self.grid_windows):
                 try:
@@ -1218,6 +1246,10 @@ class InteractiveCropComparator:
                 except Exception:
                     pass
             self.grid_windows.clear()
+
+            # Final layout window (preview)
+            blank = final_layout_blank()
+            cv2.imshow(self.window_final, blank)
         else:
             needed = set()
             valid_rois = [(rid, r) for rid, r in sorted(self.rois.items()) if r['rect'] is not None]
@@ -1243,10 +1275,9 @@ class InteractiveCropComparator:
 
             # Final layout window (preview only shows one image)
             preview_key = self.preview_key or self.reference_key
-            final = self.build_final_layout_for_key(preview_key)
+            final = self.build_final_layout_for_key(preview_key, sort_mode=self.sort_mode, reverse_sort=self.sort_reverse)
             if final is None:
-                blank = np.zeros((min(240, self.height), min(320, self.width), 3), dtype=np.uint8)
-                cv2.putText(blank, "Final layout idle", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                blank = final_layout_blank()
                 cv2.imshow(self.window_final, blank)
             else:
                 # Final preview image size is not affected by scale
@@ -1283,7 +1314,7 @@ class InteractiveCropComparator:
             cv2.imwrite(orig_out, img)
 
             # Save final layout composed for this method
-            final = self.build_final_layout_for_key(m)
+            final = self.build_final_layout_for_key(m, sort_mode=self.sort_mode, reverse_sort=self.sort_reverse)
             if final is not None:
                 final_out = os.path.join(m_dir, f"final_{m}.png")
                 cv2.imwrite(final_out, final)
@@ -1335,6 +1366,7 @@ class InteractiveCropComparator:
             + f"{log.style_key('n')}/{log.style_key('p')} next/prev image, "
             + f"{log.style_key('s')} save outputs, "
             + f"{log.style_key('i')} idle toggle, "
+            + f"{log.style_key('r')} clear all rois, "
             + f"{log.style_key('z')} undo, "
             + f"{log.style_key('y')} redo, "
             + f"{log.style_key('Enter')} switch dataset/group, "
@@ -1546,6 +1578,9 @@ if __name__ == "__main__":
     comparator.layout_mode = args.layout
     comparator.preview_key = args.preview or ('GT' if 'GT' in input_folder else (
         'input' if 'input' in input_folder else next(iter(input_folder.keys()))))
+    # Sorting options for final layout
+    comparator.sort_mode = 'id'
+    comparator.sort_reverse = False
     # Log summary of loaded data
     try:
         shared_layout = any(isinstance(v, (list, tuple)) for v in input_folder.values())
