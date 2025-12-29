@@ -1,228 +1,172 @@
-# ✨ LLIE Results – Interactive Crop Comparator
+# ✨ Image Crop Comparator
 
-An interactive, keyboard-driven tool to compare and compose crops from multiple LLIE method outputs side by side. Built with Python + OpenCV and designed for fast visual inspection, precise ROI selection, and reproducible exports. Colored logs are enabled on Linux for clear feedback.
+Keyboard-driven OpenCV viewer to compare pixel level method outputs, select multiple ROIs, and export reproducible layouts. Built for fast visual inspection with transparent final composites and strict layout rules.
 
-## 🚀 Features
-- **Interactive ROIs:** selection, position, and idle modes for flexible crop control.
-- **Multi-ROI management:** numeric keys `1–9` select/add ROI by ID; `Shift+1–9` selects in selection mode; `a` adds the smallest unused ID.
-- **Per-ROI method grids:** preview the same crop across all methods in a tiled grid.
-- **Final layout preview:** compose single or multiple crops with strict layout rules (`left`, `right`, `top`, `bottom`); change at runtime via arrow keys.
-  - Configurable ordering: sort by ROI position (default) or by ROI id, with optional reverse stacking. For position mode, `left/right` stack top→bottom and `top/bottom` stack left→right.
-  - Configurable padding between crops and between the crops block and the base image.
-  - Display overlay thickness multiplier for the final layout (default ×2).
-- **Active ROI spotlight:** active ROI id is circled on the reference view for clarity.
-- **Inner crop frames:** final preview uses inner borders for crops; base image retains standard ROI boxes.
-- **Timestamped saving:** exports original, final preview, and each ROI crop under `output/<timestamp>/<dataset>/...`.
-- **Colored logs:** ANSI color output on Linux terminals; configurable log level and color toggle.
-- **Top-left overlay:** current image basename shown on the interactive window.
-- **Interactive switching:** Enter switches dataset/group via prompt; Space jumps directly to an image by name.
-- **Undo/redo:** `z` to undo, `y` to redo most actions (ROI add/move/delete, layout/frame changes, etc.).
+## 📑 Table of Contents
+- [🚀 Quick Start](#quick-start)
+- [🧰 Installation](#installation)
+- [🗂️ Workspace Layout](#workspace-layout)
+- [🧭 Usage](#usage)
+- [⚙️ CLI Options](#cli-options)
+- [🎮 Interaction](#interaction)
+- [🧪 Workflows](#workflows)
+- [💾 Saving](#saving)
+- [🎨 Logs](#logs)
+- [🛠️ Troubleshooting](#troubleshooting)
+- [🙏 Acknowledgements](#acknowledgements)
 
-## 📦 Requirements
-- Python 3.8+
-- OpenCV (`opencv-python`)
-- NumPy (`numpy`)
-- natsort (`natsort`) and Pillow (`Pillow`) – used for robust path discovery when `basic.utils.io` is not available.
-
-Install dependencies:
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install opencv-python numpy natsort Pillow
-```
-
-## 🗂️ Workspace Layout
-Method folders sit under the workspace root (e.g., `BiFormer/`, `LLFormer/`, `FourLLIE/`, etc.). Each method contains dataset groups (e.g., `LOLv2-real+`, `SDSD-indoor+`) and then a leaf dataset (e.g., `DarkFace`, `LOL`, `SDSD-indoor`).
-
-```
-<root>/
-  BiFormer/
-    LOLv2-real+/
-      LOL-v2-real/
-  FourLLIE/
-    SDSD-indoor+/
-      SDSD-indoor/
-  ...
-  compare.py
-```
-
-i.e.
-```
-<root>/
-  <method1>/
-    <group>/
-      <dataset>/
-        <img1.png>
-        <img2.png>
-        ...
-        <imgn.png>
-  <method2>/
-    <group>/
-      <dataset>/
-        <img1.png>
-        <img2.png>
-        ...
-        <imgn.png>
-```
-
-#### Supported folder layouts (select via `--structure`)
-
-1. `group-dataset-pair` (deep): `<root>/<method>/<group>/<dataset>/<pair>/<img>.png`
-```
-<root>/
-  <method1>/
-    <group>/
-      <dataset>/
-        <pair>/
-          <img1.png>
-          <img2.png>
-          ...
-          <imgn.png>
-  <method2>/
-    <group>/
-      <dataset>/
-        <pair>/
-          <img1.png>
-          <img2.png>
-          ...
-          <imgn.png>
-```
-2. `group-dataset` (default classic): `<root>/<method>/<group>/<dataset>/<img>.png`
-```
-<root>/
-  <method1>/
-    <group>/
-      <dataset>/
-        <img1.png>
-        <img2.png>
-        ...
-        <imgn.png>
-  <method2>/
-    <group>/
-      <dataset>/
-        <img1.png>
-        <img2.png>
-        ...
-        <imgn.png>
-```
-3. `dataset-only`: `<root>/<method>/<dataset>/<img>.png`
-```
-<root>/
-  <method1>/
-    <dataset>/
-      <img1.png>
-      <img2.png>
-      ...
-      <imgn.png>
-  <method2>/
-    <dataset>/
-      <img1.png>
-      <img2.png>
-      ...
-      <imgn.png>
-```
-4. `flat` (images directly under method): `<root>/<method>/<img>.png`
-```
-<root>/
-  <method1>/
-    <img1.png>
-    <img2.png>
-    ...
-    <imgn.png>
-  <method2>/
-    <img1.png>
-    <img2.png>
-    ...
-    <imgn.png>
-```
-5. `shared` (per-image folders contain per-method files): `<root>/<image-id>/<methodA>.png, <methodB>.png, ...`
-```
-<root>/
-  <img1>/
-    <method1.png>
-    <method2.png>
-    ...
-    <methodn.png>
-  <img2>/
-    <method1.png>
-    <method2.png>
-    ...
-    <methodn.png>
-```
-6. `auto` (default): tries the above in order until images are found.
-
-## 🧭 Usage
-Run locally with auto-discovery of methods:
-
+<a id="quick-start"></a>
+## 🚀 Quick Start
 ```bash
 python compare.py \
   --source local \
-  --root /mnt/yzc/Results/LLIE-results \
+  --root ./examples \
   --group LOLv2-real+ \
   --dataset LOL-v2-real \
-  --structure auto \
-  --magnify 2.0 \
   --layout right \
-  --output ./outputs
+  --structure auto
 ```
 
-Run with external video-form datasets (requires `timeline_methods.txt`):
+<a id="installation"></a>
+## 🧰 Installation
+- Python 3.8+
+- [requirements.txt](requirements.txt) pins `opencv-python==4.7.*` and `numpy==1.26.*`; install with `pip install -r requirements.txt`.
+- Packages: opencv-python, numpy, natsort, Pillow
 
 ```bash
-python compare.py \
-  --source external \
-  --dataset SDSD-indoor \
-  --pair pair13 \
-  --layout left
-
-# Explicit structure example (flat images under each method)
-python compare.py \
-  --source local \
-  --root /mnt/yzc/Results/LLIE-results \
-  --structure flat
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+pip install -r requirements.txt
 ```
 
-### ⚙️ CLI Options (selected)
+<a id="workspace-layout"></a>
+## 🗂️ Workspace Layout
+Methods live under the workspace root; each holds groups and datasets.
+
+```
+<root>/
+  <method>/
+    <group>/
+      <dataset>/
+        <images...>
+```
+
+<details open>
+<summary>Supported structures (use `--structure`)</summary>
+
+- `group-dataset-pair`: `<root>/<method>/<group>/<dataset>/<pair>/<img>.png`
+- `group-dataset` (default classic): `<root>/<method>/<group>/<dataset>/<img>.png`
+- `dataset-only`: `<root>/<method>/<dataset>/<img>.png`
+- `flat`: `<root>/<method>/<img>.png`
+- `shared`: `<root>/<image-id>/<method>.png`
+- `auto` (default): tries the above in order.
+
+</details>
+
+<a id="usage"></a>
+## 🧭 Usage
+Local images with auto-discovery:
+
+```bash
+python compare.py --source local --root <root> --group <group> --dataset <dataset> --layout right
+```
+
+External (video-form) datasets require `timeline_methods.txt`:
+
+```bash
+python compare.py --source external --dataset SDSD-indoor --pair pair13 --layout left
+```
+
+<a id="cli-options"></a>
+## ⚙️ CLI Options
+<details open>
+<summary>Core switches</summary>
+
 - `--source`: `local` or `external`
-- `--root`: workspace root for local mode
-- `--group`: dataset group under each method (hyphens auto-resolved)
-- `--dataset`: leaf dataset name
-- `--pair`: sequence name for external mode
+- `--root`: workspace root (local)
+- `--group`, `--dataset`, `--pair`: dataset selectors
+- `--structure`: layout of files (see above)
+- `--output`: output root directory
+
+</details>
+
+<details>
+<summary>Display and layout</summary>
+
+- `--layout`: `left|top|right|bottom`
 - `--columns`: grid columns for per-ROI previews
-- `--magnify`/`--scale`: display-only magnification for grid windows (final preview unscaled; multi-ROI ignores this)
-- `--layout`: final layout preview mode (`left|top|right|bottom`)
-- `--preview`: image key used in final preview (method name or `GT`/`input` if present)
-- `--mode`: startup interaction mode (`selection|position|idle`)
-- `--output`: root output directory
-- `--thickness`: line thickness for ROI boxes and crop borders
-- `--display-thickness-mult`: multiplier for line thickness in the final layout overlays
-- `--layout-padding`: padding (px) between crops and between crops and the base image in the final layout
-- `--no-color`: disable ANSI colored logs
+- `--magnify` / `--scale`: display-only magnification (ignored for multi-ROI final)
+- `--layout-padding`: padding between crops and base image
+- `--display-thickness-mult`: overlay thickness multiplier for final layout
+
+</details>
+
+<details>
+<summary>Interaction defaults</summary>
+
+- `--mode`: `selection|position|idle`
+- `--preview`: method key for final preview (`GT`/`input` if present)
+- `--thickness`: ROI and crop border thickness
+
+</details>
+
+<details>
+<summary>Logging</summary>
+
 - `--log-level`: `debug|info|warn|error`
+- `--no-color`: disable ANSI colors
 
-## 🎮 Interaction & Shortcuts
-- Mouse: draw in selection mode; drag to reposition in position mode.
-- `a`: add smallest unused ROI ID.
-- `1–9`: add/select ROI by ID; pressing the active ROI id again enters selection mode.
-- `Shift+1–9`: if the target ROI id does not exist, duplicate the active ROI into that id; if it exists, copy the active ROI’s size to the target ROI (center preserved).
-- `d`: add a new ROI with the same size as the current active ROI (uses the smallest unused ID).
-- Arrow keys: set layout (`← left`, `↑ top`, `→ right`, `↓ bottom`).
-- `z` / `y`: undo / redo the last action (ROI edits, layout or frame changes, etc.).
-- `Enter`: switch dataset or group/dataset (typed as `group/dataset`).
-- `Space`: jump to an image by name (stem or filename); logs if missing.
-- `n` / `p`: next / previous image.
-- `s`: save outputs.
-- `i`: idle toggle (hide/show grids).
-- `r`: clear all ROIs.
-- `q` or `Esc`: quit.
+</details>
 
-## 🖼️ Quick tutorial
+<a id="interaction"></a>
+## 🎮 Interaction
+<details open>
+<summary>Mouse</summary>
 
-short walkthrough showing ROI selection.
+- Draw in selection mode; drag to reposition in position mode.
+- Hold `Shift` while drawing a ROI: constrain to a square using the longer side.
 
-<img src="figures/basic_op_video.gif" style="width: 100%;">
+Quick actions:
+- Right-click on overlapping ROIs: cycle to the next higher id in that stack (wraps to smallest).
+- Right-click outside any ROI: add the next ROI (same as `a`).
+- Right-click down inside a ROI, release after the cursor leaves that ROI: delete it.
+- Middle-button inside the active ROI: duplicate it to a new ROI, then drag the new ROI while holding.
+- Middle-button inside a non-active ROI: copy the active ROI size to that ROI (Shift+digit).
 
-Basic ROI operations:
+</details>
+
+<details open>
+<summary>Keyboard</summary>
+
+- `a`: add smallest unused ROI id
+- `1–9`: add/select ROI by id; tapping active id enters selection mode
+- `Shift+1–9`: duplicate active ROI to target id or copy its size
+- `d`: add ROI with active size
+- Arrow keys: set layout (`← left`, `↑ top`, `→ right`, `↓ bottom`)
+- `z` / `y`: undo / redo
+- `Enter`: switch dataset or `group/dataset`
+- `Space`: jump to image by name
+- `n` / `p`: next / previous image
+- `s`: save outputs
+- `i`: idle toggle (hide/show grids)
+- `r`: clear all ROIs
+- `q` or `Esc`: quit
+
+</details>
+
+<a id="workflows"></a>
+## 🧪 Workflows
+<details open>
+<summary>Quick tutorial</summary>
+
+Short walkthrough showing ROI selection.
+
+<img src="figures/basic_op_video.gif" style="width: 100%;" alt="Basic operations">
+
+</details>
+
+<details open>
+<summary>Basic ROI operations</summary>
 
 | Select ROI                                  | Move ROI                                | Add ROI                                    |
 |---------------------------------------------|-----------------------------------------|--------------------------------------------|
@@ -232,20 +176,37 @@ Basic ROI operations:
 |-------------------------------------------------|---------------------------------------------|
 | ![Reselect ROI](figures/reselect_crop_area.png) | ![Delete ROI](figures/delete_crop_area.png) |
 
-More flexible layout directions:
+</details>
+
+<details>
+<summary>Layout directions</summary>
 
 | Layout left                                 | Layout right                                  | Layout top                               | Layout bottom                                   |
 |---------------------------------------------|-----------------------------------------------|------------------------------------------|-------------------------------------------------|
 | ![Layout left](figures/layout_left_img.png) | ![Layout right](figures/layout_right_img.png) | ![Layout top](figures/layout_top_img.png) | ![Layout bottom](figures/layout_bottom_img.png) |
 
-More layout options:
+</details>
+
+<details>
+<summary>Layout capacities</summary>
 
 | Single ROI (one)                      | Two ROIs                              | Three ROIs                                | More than three ROIs                    |
 |---------------------------------------|---------------------------------------|-------------------------------------------|-----------------------------------------|
 | ![Layout one](figures/layout_one.png) | ![Layout two](figures/layout_two.png) | ![Layout three](figures/layout_three.png) | ![Layout more](figures/layout_more.png) |
 
-## 💾 Saving Structure
-On save (`s`), outputs are written to:
+</details>
+
+<details>
+<summary>Mouse-only quick tour</summary>
+
+Optional mouse-only quick tour (all operations by mouse):
+<img src="figures/mouse_op_video.gif" style="width: 100%;" alt="Mouse-only operations (optional)">
+
+</details>
+
+<a id="saving"></a>
+## 💾 Saving
+On `s`, outputs are written to:
 
 ```
 <output>/<timestamp>/<dataset>/<image-basename>/
@@ -254,17 +215,19 @@ On save (`s`), outputs are written to:
   crop_roi<id>_<method>.png
 ```
 
-Each method writes its own original, composed final preview, and all crops for active ROIs.
+Each method writes its own originals, composed final previews, and all crops for active ROIs.
 
-## 🎨 Colored Logs
-- Linux terminals display colored status messages: info (cyan), success (green), warnings (yellow), errors (red), and notes (bright cyan).
-- Banners use terminal-width separators with centered timestamps; tokens (keys/modes/paths) are colored for quick scanning.
-- Toggle colors with `--no-color`; control verbosity with `--log-level`.
+<a id="logs"></a>
+## 🎨 Logs
+- Linux terminals show colored status messages: info (cyan), success (green), warnings (yellow), errors (red), notes (bright cyan).
+- Toggle with `--no-color`; set verbosity via `--log-level`.
 
+<a id="troubleshooting"></a>
 ## 🛠️ Troubleshooting
 - "Folder has no images": check dataset path and image extensions.
-- "timeline_methods.txt is required": provide a method list when using `--source external`.
-- Window not responsive: ensure your environment supports OpenCV GUI; on headless servers use a local machine or X-forwarding.
+- "timeline_methods.txt is required": needed for `--source external`.
+- GUI not responsive: ensure OpenCV GUI support; on headless servers use a local machine or X-forwarding.
 
+<a id="acknowledgements"></a>
 ## 🙏 Acknowledgements
-This tool is inspired by practical LLIE evaluation workflows and built for fast iteration and visual clarity.
+Built for fast LLIE evaluation workflows.

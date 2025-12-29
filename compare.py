@@ -2,6 +2,7 @@ import copy
 import math
 import os
 import sys
+import time
 from datetime import datetime
 from glob import glob
 
@@ -305,8 +306,8 @@ class InteractiveCropComparator:
             line_thickness=5,
             layout_border_scale=2.0,
             layout_gap=10,
-            layout_bg_color='transparent',
-                layout_min_scale=1.0,
+            layout_bg_color: str | tuple='transparent',
+            layout_min_scale=1.0,
             current_group=None,
             current_dataset=None,
             method_roots=None,
@@ -376,6 +377,7 @@ class InteractiveCropComparator:
             (255, 255, 0),  # cyan
             (255, 255, 255),  # white
             (0, 165, 255),  # orange
+            (128, 128, 0),  # olive
         ]
 
         self.line_color = (0, 0, 255)
@@ -440,6 +442,12 @@ class InteractiveCropComparator:
         self._pre_drag_snapshot = None
         self.needs_update = True
         self._idle_return_mode = 'selection'
+        # Mouse state
+        self._rbutton_down_roi_id = None
+        self._rbutton_left_roi = False
+        self._drag_button = None
+        self._mb_down_roi_id = None
+        self._mb_down_point = None
         # dataset/group tracking
         self.group = current_group
         self.dataset = current_dataset
@@ -928,12 +936,138 @@ class InteractiveCropComparator:
         self.selection_start = None
         self.request_update()
 
+    def _rois_at_point(self, x, y):
+        hits = []
+        for rid in sorted(self.rois.keys()):
+            rect = self.rois[rid].get('rect')
+            if rect is None:
+                continue
+            x1, y1, x2, y2 = rect
+            x1, x2 = (x1, x2) if x1 <= x2 else (x2, x1)
+            y1, y2 = (y1, y2) if y1 <= y2 else (y2, y1)
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                hits.append(rid)
+        return hits
+
+    def _roi_at_point(self, x, y):
+        hits = self._rois_at_point(x, y)
+        return hits[0] if hits else None
+
+    def _point_in_roi(self, rid, x, y):
+        rect = self.rois.get(rid, {}).get('rect')
+        if rect is None:
+            return False
+        x1, y1, x2, y2 = rect
+        x1, x2 = (x1, x2) if x1 <= x2 else (x2, x1)
+        y1, y2 = (y1, y2) if y1 <= y2 else (y2, y1)
+        return x1 <= x <= x2 and y1 <= y <= y2
+
+    def _square_rect(self, sx, sy, ex, ey, force_square=False):
+        if not force_square:
+            return (sx, sy, ex, ey)
+        dx = ex - sx
+        dy = ey - sy
+        side = max(abs(dx), abs(dy))
+        if side == 0:
+            return (sx, sy, ex, ey)
+        sx_sign = 1 if dx >= 0 else -1
+        sy_sign = 1 if dy >= 0 else -1
+        return (sx, sy, sx + sx_sign * side, sy + sy_sign * side)
+
     def on_mouse(self, event, x, y, flags, param):
+        if event == cv2.EVENT_RBUTTONDOWN or event == cv2.EVENT_RBUTTONDBLCLK:
+            rois_here = self._rois_at_point(x, y)
+            target = None
+            if rois_here:
+                if self.active_roi in rois_here:
+                    idx = rois_here.index(self.active_roi)
+                    target = rois_here[idx]
+                else:
+                    target = rois_here[0]
+            else:
+                self._cmd_add_roi()
+            self._rbutton_down_roi_id = target
+            self._rbutton_left_roi = False
+            return
+        elif event == cv2.EVENT_RBUTTONUP:
+            if self._rbutton_down_roi_id is not None:
+                rbutton_leave_roi = not self._point_in_roi(self._rbutton_down_roi_id, x, y)
+                if rbutton_leave_roi:
+                    rid = self._rbutton_down_roi_id
+                    if rid in self.rois:
+                        self.active_roi = rid
+                        self._cmd_delete_roi()
+                elif not self._rbutton_left_roi:
+                    rois_here = self._rois_at_point(x, y)
+                    if self.active_roi in rois_here:
+                        idx = rois_here.index(self.active_roi)
+                        target = rois_here[(idx + 1) % len(rois_here)]
+                    else:
+                        target = rois_here[0]
+                    self._cmd_digit_roi(target)
+                self._rbutton_down_roi_id = None
+                self._rbutton_left_roi = False
+            return
+        elif event == cv2.EVENT_MBUTTONDOWN:
+            hit_id = self._roi_at_point(x, y)
+            self._mb_down_roi_id = hit_id
+            self._mb_down_point = (x, y)
+            if hit_id is not None:
+                if self.active_roi == hit_id:
+                    # Duplicate active ROI and drag the new one
+                    self._cmd_duplicate_roi()
+                    new_id = self.active_roi
+                    roi = self.rois.get(new_id)
+                    if roi is not None:
+                        self.dragging = True
+                        self._drag_button = 'middle'
+                        self._pre_drag_state = (new_id, roi['rect'])
+                        self._pre_drag_snapshot = self._snapshot_rois()
+                        self.mode = 'position'
+                        self.selection_start = None
+                        self._mb_down_roi_id = new_id
+                else:
+                    # Copy active ROI size to this ROI (Shift+digit behavior)
+                    self._cmd_shift_digit(hit_id)
+            return
+        elif event == cv2.EVENT_MBUTTONUP:
+            if self.dragging and self._drag_button == 'middle' and self.active_roi is not None:
+                roi = self.rois[self.active_roi]
+                self.dragging = False
+                prev_state = self._pre_drag_state
+                if self.mode == 'position' and roi['rect'] is not None:
+                    x1, y1, x2, y2 = roi['rect']
+                    w = x2 - x1
+                    h = y2 - y1
+                    cx, cy = x, y
+                    x1 = int(cx - w // 2)
+                    y1 = int(cy - h // 2)
+                    x2 = x1 + w
+                    y2 = y1 + h
+                    roi['rect'] = (x1, y1, x2, y2)
+                if prev_state is not None:
+                    rid, old_rect = prev_state
+                    new_rect = roi['rect']
+                    if rid == self.active_roi and old_rect != new_rect and self._pre_drag_snapshot is not None:
+                        self._record_rois_change("move/resize roi", before=self._pre_drag_snapshot)
+                self._pre_drag_snapshot = None
+                self._drag_button = None
+                self.request_update()
+            else:
+                self._drag_button = None
+            self._mb_down_roi_id = None
+            self._mb_down_point = None
+            return
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if self._rbutton_down_roi_id is not None and not self._rbutton_left_roi:
+                if not self._point_in_roi(self._rbutton_down_roi_id, x, y):
+                    self._rbutton_left_roi = True
         if self.active_roi is None:
             return
         roi = self.rois[self.active_roi]
         if event == cv2.EVENT_LBUTTONDOWN:
             self.dragging = True
+            self._drag_button = 'left'
             self._pre_drag_state = (self.active_roi, roi['rect'])
             self._pre_drag_snapshot = self._snapshot_rois()
             if self.mode in ['selection', 'idle'] or roi['rect'] is None:
@@ -953,7 +1087,9 @@ class InteractiveCropComparator:
         elif event == cv2.EVENT_MOUSEMOVE and self.dragging:
             if self.mode == 'selection' and self.selection_start is not None:
                 sx, sy = self.selection_start
-                roi['rect'] = (sx, sy, x, y)
+                shift_on = bool(flags & cv2.EVENT_FLAG_SHIFTKEY)
+                sx2, sy2, ex2, ey2 = self._square_rect(sx, sy, x, y, force_square=shift_on)
+                roi['rect'] = (sx2, sy2, ex2, ey2)
             elif self.mode == 'position' and roi['rect'] is not None:
                 x1, y1, x2, y2 = roi['rect']
                 w = x2 - x1
@@ -967,10 +1103,13 @@ class InteractiveCropComparator:
             self.request_update()
         elif event == cv2.EVENT_LBUTTONUP:
             self.dragging = False
+            self._drag_button = None
             prev_state = self._pre_drag_state
             if self.mode == 'selection' and self.selection_start is not None:
                 sx, sy = self.selection_start
-                roi['rect'] = (sx, sy, x, y)
+                shift_on = bool(flags & cv2.EVENT_FLAG_SHIFTKEY)
+                sx2, sy2, ex2, ey2 = self._square_rect(sx, sy, x, y, force_square=shift_on)
+                roi['rect'] = (sx2, sy2, ex2, ey2)
                 self.selection_start = None
                 self.mode = 'position'
             elif self.mode == 'position' and roi['rect'] is not None:
@@ -1623,9 +1762,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', choices=['local', 'external'], default='local', type=str,
-                        help='Data source: local uses the workspace structure under --root; external uses /data/xr paths with --pair videos.')
+                        help='Data source: local uses the workspace structure under --root; external uses /data/user paths with --pair videos.')
     parser.add_argument('--root', '-r', default='./examples', type=str,
-                        help='Workspace root containing method folders (local mode only). Example: /mnt/yzc/Results/LLIE-results')
+                        help='Workspace root containing method folders (local mode only). Example: /mnt/user/results/LLIE-results')
     parser.add_argument('--group', '-g', default='SDSD-indoor+', type=str,
                         help='Dataset group folder under each method (e.g., LOLv2-real+, SDSD-indoor+). Hyphens are auto-resolved across methods.')
     parser.add_argument('--dataset', '-ds', default='SDSD-indoor', type=str,
@@ -1676,14 +1815,14 @@ if __name__ == "__main__":
     if args.source == 'external':
         if not methods:
             raise ValueError("timeline_methods.txt is required for external source")
-        input_folder = {m: f"/data/xr/LLVE_results/VideoForm/{m}/{dataset}/pred/{pair}" for m in methods}
+        input_folder = {m: f"/data/user/results/{m}/{dataset}/pred/{pair}" for m in methods}
 
         # Optional GT/input reference if available
         gt_path = ""
         gt_path_exist = False
         for phase in ['test', 'eval']:
             for gt in ['GT', 'high']:
-                gt_path = f"/data/xr/Dataset/LLVE_dataset/{dataset}_png/{phase}/{gt}/{pair}"
+                gt_path = f"/data/user/datasets/{dataset}/{phase}/{gt}/{pair}"
                 if os.path.exists(gt_path):
                     gt_path_exist = True
                     break
