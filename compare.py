@@ -305,7 +305,8 @@ class InteractiveCropComparator:
             line_thickness=5,
             layout_border_scale=2.0,
             layout_gap=10,
-            layout_bg_color=(255, 255, 255),
+            layout_bg_color='transparent',
+                layout_min_scale=1.0,
             current_group=None,
             current_dataset=None,
             method_roots=None,
@@ -392,17 +393,42 @@ class InteractiveCropComparator:
         except Exception:
             self.layout_gap = 10
         try:
+            self.layout_min_scale = max(0.01, float(layout_min_scale))
+        except Exception:
+            self.layout_min_scale = 1.0
+        self.layout_use_alpha = False
+        try:
             if isinstance(layout_bg_color, str):
-                parts = [int(x) for x in layout_bg_color.replace(' ', '').split(',') if x != '']
-                if len(parts) == 3:
-                    layout_bg_color = tuple(max(0, min(255, v)) for v in parts)
-            self.layout_bg_color = tuple(layout_bg_color) if len(layout_bg_color) == 3 else (255, 255, 255)
+                lb = layout_bg_color.strip().lower()
+                if lb == 'transparent':
+                    layout_bg_color = (0, 0, 0, 0)
+                    self.layout_use_alpha = True
+                else:
+                    parts = [int(x) for x in layout_bg_color.replace(' ', '').split(',') if x != '']
+                    if len(parts) == 4:
+                        layout_bg_color = tuple(max(0, min(255, v)) for v in parts)
+                        self.layout_use_alpha = True
+                    elif len(parts) == 3:
+                        layout_bg_color = tuple(max(0, min(255, v)) for v in parts)
+                    else:
+                        raise ValueError()
+            else:
+                seq = tuple(layout_bg_color)
+                if len(seq) == 4:
+                    layout_bg_color = seq
+                    self.layout_use_alpha = True
+                elif len(seq) == 3:
+                    layout_bg_color = seq
+                else:
+                    raise ValueError()
+            self.layout_bg_color = layout_bg_color
         except Exception:
             self.layout_bg_color = (255, 255, 255)
+            self.layout_use_alpha = False
 
         self.cached_images = None
         self.grid_windows = set()
-        self.layout_mode = 'right'  # 'left' | 'up' | 'right' | 'bottom'
+        self.layout_mode = 'right'  # 'left' | 'top' | 'right' | 'bottom'
         self.sort_mode = 'position'  # 'position' | 'id'
         self.sort_reverse = False
         self.preview_key = reference_key
@@ -514,7 +540,7 @@ class InteractiveCropComparator:
             self.dispatcher.register(ord(sym), lambda rid=rid: self._cmd_shift_digit(rid))
         # arrow keys
         self.dispatcher.register(81, lambda: self._cmd_layout('left'))
-        self.dispatcher.register(82, lambda: self._cmd_layout('up'))
+        self.dispatcher.register(82, lambda: self._cmd_layout('top'))
         self.dispatcher.register(83, lambda: self._cmd_layout('right'))
         self.dispatcher.register(84, lambda: self._cmd_layout('bottom'))
         # delete/backspace
@@ -598,7 +624,6 @@ class InteractiveCropComparator:
         self.request_update()
 
     def _cmd_save(self):
-        self.save_session_ts = None  # new session per save trigger
         label = getattr(self, 'save_label', self.dataset)
         self.save(label, self.dataset)
 
@@ -687,6 +712,31 @@ class InteractiveCropComparator:
     def request_update(self):
         """Mark UI as dirty; main loop will repaint."""
         self.needs_update = True
+
+    def _color_with_alpha(self, color):
+        """Return a color matching the current canvas channel count."""
+        if self.layout_use_alpha:
+            if len(color) == 4:
+                return tuple(color)
+            return (color[0], color[1], color[2], 255)
+        return tuple(color[:3])
+
+    def _to_canvas_image(self, img):
+        """Ensure image matches the current canvas channel count."""
+        if img is None:
+            return None
+        if self.layout_use_alpha:
+            if img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            if img.shape[2] == 3:
+                return cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+        return img
+
+    def _blank_canvas(self, height, width):
+        """Create a blank canvas with correct channel count and background."""
+        if self.layout_use_alpha:
+            return np.full((height, width, 4), self.layout_bg_color, dtype=np.uint8)
+        return np.full((height, width, 3), self.layout_bg_color, dtype=np.uint8)
 
     def color_for_id(self, roi_id):
         if not self.palette:
@@ -1024,6 +1074,7 @@ class InteractiveCropComparator:
         ref = self.read_frame(key, self.current_frame)
         if ref is None:
             return None
+        ref = self._to_canvas_image(ref)
         H, W = ref.shape[:2]
         valid = [(rid, r) for rid, r in sorted(self.rois.items()) if r['rect'] is not None]
         # Determine sorting strategy
@@ -1078,7 +1129,7 @@ class InteractiveCropComparator:
             out = ref.copy()
             out[y0:y0 + gh, x0:x0 + gw] = crop
             # draw ROI box on full image and crop box in final
-            color = r0['color']
+            color = self._color_with_alpha(r0['color'])
             cv2.rectangle(out, (x1, y1), (x2, y2), color, self.line_thickness)
             self.draw_inner_border(out, x0, y0, gw, gh, color, thickness=block_line_th)
             return out
@@ -1090,120 +1141,252 @@ class InteractiveCropComparator:
             c = ref[y1:y2, x1:x2]
             if c is not None and c.size > 0:
                 crops.append(c)
-                roi_info.append({'id': rid, 'color': r['color']})
+                roi_info.append({'id': rid, 'color': self._color_with_alpha(r['color'])})
         if len(crops) == 0:
             return ref.copy()
         mode = self.layout_mode
+        # Utility: even split counts for k groups
+        def _even_counts(total, k):
+            base = total // k
+            rem = total % k
+            return [base + 1] * rem + [base] * (k - rem)
+
+        # Evaluate column/row groupings by maximizing sum(scales) / extent
+        def _best_counts_lr(crops_list):
+            max_score = -1.0
+            best = [len(crops_list)]
+            max_h = max(c.shape[0] for c in crops_list)
+            min_scale = max(self.layout_min_scale, 0.01)
+            for k in range(1, len(crops_list) + 1):
+                counts = _even_counts(len(crops_list), k)
+                idx = 0
+                col_ws = []
+                col_hs = []
+                scale_sum = 0.0
+                valid = True
+                for cnum in counts:
+                    subset = crops_list[idx:idx + cnum]
+                    idx += cnum
+                    h0s = []
+                    w0s = []
+                    for g in subset:
+                        gh, gw = g.shape[:2]
+                        s0 = W / max(gw, 1)
+                        h0 = gh * s0
+                        w0 = gw * s0
+                        h0s.append(h0)
+                        w0s.append(w0)
+                    Hp = sum(h0s)
+                    if Hp <= 0:
+                        valid = False
+                        break
+                    s_global = (H - self.layout_gap) / Hp
+                    final_scales = [ (W / max(subset[i].shape[1],1)) * s_global for i in range(len(subset)) ]
+                    if min(final_scales) < min_scale - 1e-9:
+                        valid = False
+                        break
+                    scale_sum += sum(final_scales)
+                    col_w = max(w * s_global for w in w0s)
+                    col_h = sum(h * s_global for h in h0s) + self.layout_gap * (len(subset) - 1 if len(subset) > 0 else 0)
+                    col_ws.append(col_w)
+                    col_hs.append(col_h)
+                if not valid:
+                    continue
+                block_w_total = sum(col_ws) + self.layout_gap * (len(col_ws) - 1 if len(col_ws) > 0 else 0)
+                block_h_total = max(col_hs) if col_hs else 1.0
+                score = scale_sum / max(block_w_total, 1e-6)
+                if score > max_score:
+                    max_score = score
+                    best = counts
+            return best
+
+        def _best_counts_tb(crops_list):
+            max_score = -1.0
+            best = [len(crops_list)]
+            max_w = max(c.shape[1] for c in crops_list)
+            min_scale = max(self.layout_min_scale, 0.01)
+            for k in range(1, len(crops_list) + 1):
+                counts = _even_counts(len(crops_list), k)
+                idx = 0
+                row_ws = []
+                row_hs = []
+                scale_sum = 0.0
+                valid = True
+                for cnum in counts:
+                    subset = crops_list[idx:idx + cnum]
+                    idx += cnum
+                    w0s = []
+                    h0s = []
+                    for g in subset:
+                        gh, gw = g.shape[:2]
+                        s0 = H / max(gh, 1)
+                        h0 = gh * s0
+                        w0 = gw * s0
+                        w0s.append(w0)
+                        h0s.append(h0)
+                    Wp = sum(w0s)
+                    if Wp <= 0:
+                        valid = False
+                        break
+                    s_global = (W - self.layout_gap) / Wp
+                    final_scales = [ (H / max(subset[i].shape[0],1)) * s_global for i in range(len(subset)) ]
+                    if min(final_scales) < min_scale - 1e-9:
+                        valid = False
+                        break
+                    scale_sum += sum(final_scales)
+                    row_w = sum(w * s_global for w in w0s) + self.layout_gap * (len(subset) - 1 if len(subset) > 0 else 0)
+                    row_h = max(h * s_global for h in h0s)
+                    row_ws.append(row_w)
+                    row_hs.append(row_h)
+                if not valid:
+                    continue
+                block_w_total = max(row_ws) if row_ws else 1.0
+                block_h_total = sum(row_hs) + self.layout_gap * (len(row_hs) - 1 if len(row_hs) > 0 else 0)
+                score = scale_sum / max(block_h_total, 1e-6)
+                if score > max_score:
+                    max_score = score
+                    best = counts
+            return best
+
         if mode in ['left', 'right']:
-            # Rule: scale all crops to width W, get stacked height H', then globally scale to fit height H.
-            resized0 = []
-            heights_scaled = []
-            for g in crops:
-                gh, gw = g.shape[:2]
-                s0 = W / max(gw, 1)
-                w0 = int(round(gw * s0))
-                h0 = int(round(gh * s0))
-                img0 = cv2.resize(g, (w0, h0), interpolation=cv2.INTER_NEAREST)
-                heights_scaled.append(h0)
-                resized0.append(img0)
-            Hp = sum(heights_scaled)
-            s_global = (H - self.layout_gap) / max(Hp, 1)
-            resized = []
-            for img0 in resized0:
-                h0, w0 = img0.shape[:2]
-                h1 = max(1, int(round(h0 * s_global)))
-                w1 = max(1, int(round(w0 * s_global)))
-                img1 = cv2.resize(img0, (w1, h1), interpolation=cv2.INTER_NEAREST)
-                resized.append(img1)
+            counts = _best_counts_lr(crops)
+
+            col_blocks = []
+            idx = 0
             inner_pad = self.layout_gap
-            block_w = max(img.shape[1] for img in resized)
-            block_h = sum(img.shape[0] for img in resized) + inner_pad * (len(resized) - 1 if len(resized) > 0 else 0)
-            block = np.full((block_h, block_w, 3), self.layout_bg_color, dtype=np.uint8)
-            y = 0
-            for idx_img, img in enumerate(resized):
-                h, w = img.shape[:2]
-                x = (block_w - w) // 2
-                block[y:y + h, x:x + w] = img
-                color = roi_info[idx_img]['color'] if idx_img < len(roi_info) else (255, 255, 255)
-                self.draw_inner_border(block, x, y, w, h, color, thickness=block_line_th)
-                y += h
-                if idx_img < len(resized) - 1:
-                    y += inner_pad
+            for cnum in counts:
+                subset = crops[idx:idx + cnum]
+                subset_info = roi_info[idx:idx + cnum]
+                idx += cnum
+                resized0 = []
+                heights_scaled = []
+                for g in subset:
+                    gh, gw = g.shape[:2]
+                    s0 = W / max(gw, 1)
+                    w0 = int(round(gw * s0))
+                    h0 = int(round(gh * s0))
+                    img0 = cv2.resize(g, (w0, h0), interpolation=cv2.INTER_NEAREST)
+                    heights_scaled.append(h0)
+                    resized0.append(img0)
+                Hp = sum(heights_scaled)
+                s_global = (H - inner_pad) / max(Hp, 1)
+                resized = []
+                for img0 in resized0:
+                    h0, w0 = img0.shape[:2]
+                    h1 = max(1, int(round(h0 * s_global)))
+                    w1 = max(1, int(round(w0 * s_global)))
+                    img1 = cv2.resize(img0, (w1, h1), interpolation=cv2.INTER_NEAREST)
+                    resized.append(img1)
+                block_w = max(img.shape[1] for img in resized)
+                block_h = sum(img.shape[0] for img in resized) + inner_pad * (len(resized) - 1 if len(resized) > 0 else 0)
+                block = self._blank_canvas(block_h, block_w)
+                y = 0
+                for idx_img, img in enumerate(resized):
+                    h, w = img.shape[:2]
+                    x = (block_w - w) // 2
+                    block[y:y + h, x:x + w] = img
+                    color = subset_info[idx_img]['color'] if idx_img < len(subset_info) else (255, 255, 255)
+                    self.draw_inner_border(block, x, y, w, h, color, thickness=block_line_th)
+                    y += h
+                    if idx_img < len(resized) - 1:
+                        y += inner_pad
+                col_blocks.append(block)
+
             pad = self.layout_gap
-            canvas_h = max(H, block_h)
-            canvas_w = W + block_w + pad
-            out = np.full((canvas_h, canvas_w, 3), self.layout_bg_color, dtype=np.uint8)
-            # place full image
+            block_w_total = sum(b.shape[1] for b in col_blocks) + pad * (len(col_blocks) - 1 if len(col_blocks) > 0 else 0)
+            block_h_total = max(b.shape[0] for b in col_blocks) if col_blocks else 0
+            canvas_h = max(H, block_h_total)
+            canvas_w = W + block_w_total + pad
+            out = self._blank_canvas(canvas_h, canvas_w)
             fy = (canvas_h - H) // 2
             if mode == 'left':
-                fx = block_w + pad
+                fx = block_w_total + pad
                 bx = 0
             else:  # right
                 fx = 0
                 bx = W + pad
-            by = (canvas_h - block_h) // 2
-            # draw ROI boxes on full image
+            by = (canvas_h - block_h_total) // 2 if block_h_total > 0 else 0
             base = ref.copy()
             for _, r in valid:
                 x1, y1, x2, y2 = self.clamp_rect(r['rect'])
-                cv2.rectangle(base, (x1, y1), (x2, y2), r['color'], self.line_thickness)
+                cv2.rectangle(base, (x1, y1), (x2, y2), self._color_with_alpha(r['color']), self.line_thickness)
             out[fy:fy + H, fx:fx + W] = base
-            out[by:by + block_h, bx:bx + block_w] = block
+            x_cursor = bx
+            for b in col_blocks:
+                h, w = b.shape[:2]
+                y_cursor = by + (block_h_total - h) // 2
+                out[y_cursor:y_cursor + h, x_cursor:x_cursor + w] = b
+                x_cursor += w + pad
             return out
-        else:  # 'up' or 'bottom'
-            # Rule: scale all crops to height H, get stacked width W', then globally scale to fit width W.
-            resized0 = []
-            widths_scaled = []
-            for g in crops:
-                gh, gw = g.shape[:2]
-                s0 = H / max(gh, 1)
-                h0 = int(round(gh * s0))
-                w0 = int(round(gw * s0))
-                img0 = cv2.resize(g, (w0, h0), interpolation=cv2.INTER_NEAREST)
-                widths_scaled.append(w0)
-                resized0.append(img0)
-            Wp = sum(widths_scaled)
-            s_global = (W - self.layout_gap) / max(Wp, 1)
-            resized = []
-            for img0 in resized0:
-                h0, w0 = img0.shape[:2]
-                w1 = max(1, int(round(w0 * s_global)))
-                h1 = max(1, int(round(h0 * s_global)))
-                img1 = cv2.resize(img0, (w1, h1), interpolation=cv2.INTER_NEAREST)
-                resized.append(img1)
+        else:  # 'top' or 'bottom'
+            counts = _best_counts_tb(crops)
+
+            row_blocks = []
+            idx = 0
             inner_pad = self.layout_gap
-            block_w = sum(img.shape[1] for img in resized) + inner_pad * (len(resized) - 1 if len(resized) > 0 else 0)
-            block_h = max(img.shape[0] for img in resized)
-            block = np.full((block_h, block_w, 3), self.layout_bg_color, dtype=np.uint8)
-            x = 0
-            for idx_img, img in enumerate(resized):
-                h, w = img.shape[:2]
-                y = (block_h - h) // 2
-                block[y:y + h, x:x + w] = img
-                color = roi_info[idx_img]['color'] if idx_img < len(roi_info) else (255, 255, 255)
-                self.draw_inner_border(block, x, y, w, h, color, thickness=block_line_th)
-                x += w
-                if idx_img < len(resized) - 1:
-                    x += inner_pad
+            for cnum in counts:
+                subset = crops[idx:idx + cnum]
+                subset_info = roi_info[idx:idx + cnum]
+                idx += cnum
+                resized0 = []
+                widths_scaled = []
+                for g in subset:
+                    gh, gw = g.shape[:2]
+                    s0 = H / max(gh, 1)
+                    h0 = int(round(gh * s0))
+                    w0 = int(round(gw * s0))
+                    img0 = cv2.resize(g, (w0, h0), interpolation=cv2.INTER_NEAREST)
+                    widths_scaled.append(w0)
+                    resized0.append(img0)
+                Wp = sum(widths_scaled)
+                s_global = (W - inner_pad) / max(Wp, 1)
+                resized = []
+                for img0 in resized0:
+                    h0, w0 = img0.shape[:2]
+                    w1 = max(1, int(round(w0 * s_global)))
+                    h1 = max(1, int(round(h0 * s_global)))
+                    img1 = cv2.resize(img0, (w1, h1), interpolation=cv2.INTER_NEAREST)
+                    resized.append(img1)
+                block_w = sum(img.shape[1] for img in resized) + inner_pad * (len(resized) - 1 if len(resized) > 0 else 0)
+                block_h = max(img.shape[0] for img in resized)
+                block = self._blank_canvas(block_h, block_w)
+                x = 0
+                for idx_img, img in enumerate(resized):
+                    h, w = img.shape[:2]
+                    y = (block_h - h) // 2
+                    block[y:y + h, x:x + w] = img
+                    color = subset_info[idx_img]['color'] if idx_img < len(subset_info) else (255, 255, 255)
+                    self.draw_inner_border(block, x, y, w, h, color, thickness=block_line_th)
+                    x += w
+                    if idx_img < len(resized) - 1:
+                        x += inner_pad
+                row_blocks.append(block)
+
             pad = self.layout_gap
-            canvas_w = max(W, block_w)
-            canvas_h = H + block_h + pad
-            out = np.full((canvas_h, canvas_w, 3), self.layout_bg_color, dtype=np.uint8)
-            # place full image
+            block_w_total = max(b.shape[1] for b in row_blocks) if row_blocks else 0
+            block_h_total = sum(b.shape[0] for b in row_blocks) + pad * (len(row_blocks) - 1 if len(row_blocks) > 0 else 0)
+            canvas_w = max(W, block_w_total)
+            canvas_h = H + block_h_total + pad
+            out = self._blank_canvas(canvas_h, canvas_w)
             fx = (canvas_w - W) // 2
-            if mode == 'up':
-                fy = block_h + pad
+            if mode == 'top':
+                fy = block_h_total + pad
                 by = 0
             else:  # bottom
                 fy = 0
                 by = H + pad
-            bx = (canvas_w - block_w) // 2
+            bx = (canvas_w - block_w_total) // 2 if block_w_total > 0 else 0
             base = ref.copy()
             for _, r in valid:
                 x1, y1, x2, y2 = self.clamp_rect(r['rect'])
-                cv2.rectangle(base, (x1, y1), (x2, y2), r['color'], self.line_thickness)
+                cv2.rectangle(base, (x1, y1), (x2, y2), self._color_with_alpha(r['color']), self.line_thickness)
             out[fy:fy + H, fx:fx + W] = base
-            out[by:by + block_h, bx:bx + block_w] = block
+            y_cursor = by
+            for b in row_blocks:
+                h, w = b.shape[:2]
+                x_cursor = bx + (block_w_total - w) // 2
+                out[y_cursor:y_cursor + h, x_cursor:x_cursor + w] = b
+                y_cursor += h + pad
             return out
 
     def update_display(self):
@@ -1281,7 +1464,10 @@ class InteractiveCropComparator:
                 cv2.imshow(self.window_final, blank)
             else:
                 # Final preview image size is not affected by scale
-                cv2.imshow(self.window_final, final)
+                final_view = final
+                if final_view is not None and final_view.ndim == 3 and final_view.shape[2] == 4:
+                    final_view = cv2.cvtColor(final_view, cv2.COLOR_BGRA2BGR)
+                cv2.imshow(self.window_final, final_view)
         self.needs_update = False
 
     def save(self, pair, dataset):
@@ -1357,7 +1543,7 @@ class InteractiveCropComparator:
         log.info(
             "Arrow keys (switch final layout on the fly): "
             + f"{log.style_key('←')} {log.style_mode('left')} (crops stack left), "
-            + f"{log.style_key('↑')} {log.style_mode('up')} (crops stack above), "
+            + f"{log.style_key('↑')} {log.style_mode('top')} (crops stack above), "
             + f"{log.style_key('→')} {log.style_mode('right')} (crops stack right), "
             + f"{log.style_key('↓')} {log.style_mode('bottom')} (crops stack below)"
         )
@@ -1452,8 +1638,8 @@ if __name__ == "__main__":
                         help='Gap (in pixels) between tiles in per-ROI method grid windows (default: 2).')
     parser.add_argument('--magnify', '--scale', default=2.0, type=float,
                         help='Display-only magnification for crop grid windows. Final preview is not globally scaled; multi-ROI ignores this.')
-    parser.add_argument('--layout', default='right', type=str, choices=['left', 'up', 'right', 'bottom'],
-                        help='Final layout preview mode. Use arrow keys at runtime: ← left, ↑ up, → right, ↓ bottom.')
+    parser.add_argument('--layout', default='right', type=str, choices=['left', 'top', 'right', 'bottom'],
+                        help='Final layout preview mode. Use arrow keys at runtime: ← left, ↑ top, → right, ↓ bottom..')
     parser.add_argument('--preview', default=None, type=str,
                         help='Image key to show in Final Layout preview (default: reference key). Keys come from method names or GT/input if present.')
     parser.add_argument('--mode', '-m', default='selection', type=str, choices=['selection', 'position', 'idle'],
@@ -1466,8 +1652,8 @@ if __name__ == "__main__":
                         help='Thickness multiplier applied only to crop block borders in final layout (default: 2.0).')
     parser.add_argument('--layout-gap', default=10, type=int,
                         help='Gap (in pixels) between base image and crop block, and between crops themselves (default: 10).')
-    parser.add_argument('--layout-bg-color', default='255,255,255', type=str,
-                        help='Padding/background color as R,G,B for gaps in final layout (default: 255,255,255 for white).')
+    parser.add_argument('--layout-bg-color', default='transparent', type=str,
+                        help='Padding/background color as R,G,B[,A] for final layout gaps, or "transparent" (default). e.g., 0,0,0 or 255,255,255,255.')
     parser.add_argument('--structure', default='auto', choices=['auto', 'group-dataset-pair', 'group-dataset', 'dataset-only', 'flat', 'shared'],
                         help='Folder structure layout: auto (default), group-dataset-pair, group-dataset, dataset-only, flat (images directly under method), or shared (image-id folders containing per-method files such as img1/methodA.png).')
     parser.add_argument('--no-color', action='store_true',
@@ -1550,14 +1736,17 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    # Parse layout background color CSV (R,G,B)
+    # Parse layout background color CSV (R,G,B[,A]) or "transparent"
     try:
-        parts = [int(x) for x in args.layout_bg_color.replace(' ', '').split(',') if x != '']
-        if len(parts) != 3:
-            raise ValueError()
-        layout_bg_color = tuple(max(0, min(255, v)) for v in parts)
+        if isinstance(args.layout_bg_color, str) and args.layout_bg_color.strip().lower() == 'transparent':
+            layout_bg_color = (0, 0, 0, 0)
+        else:
+            parts = [int(x) for x in str(args.layout_bg_color).replace(' ', '').split(',') if x != '']
+            if len(parts) not in (3, 4):
+                raise ValueError()
+            layout_bg_color = tuple(max(0, min(255, v)) for v in parts)
     except Exception:
-        layout_bg_color = (255, 255, 255)
+        layout_bg_color = (0, 0, 0, 0)
 
     comparator = InteractiveCropComparator(
         input_folder,

@@ -6,8 +6,8 @@ An interactive, keyboard-driven tool to compare and compose crops from multiple 
 - **Interactive ROIs:** selection, position, and idle modes for flexible crop control.
 - **Multi-ROI management:** numeric keys `1–9` select/add ROI by ID; `Shift+1–9` selects in selection mode; `a` adds the smallest unused ID.
 - **Per-ROI method grids:** preview the same crop across all methods in a tiled grid.
-- **Final layout preview:** compose single or multiple crops with strict layout rules (`left`, `right`, `up`, `bottom`); change at runtime via arrow keys.
-  - Configurable ordering: sort by ROI position (default) or by ROI id, with optional reverse stacking. For position mode, `left/right` stack top→bottom and `up/bottom` stack left→right.
+- **Final layout preview:** compose single or multiple crops with strict layout rules (`left`, `right`, `top`, `bottom`); change at runtime via arrow keys.
+  - Configurable ordering: sort by ROI position (default) or by ROI id, with optional reverse stacking. For position mode, `left/right` stack top→bottom and `top/bottom` stack left→right.
   - Configurable padding between crops and between the crops block and the base image.
   - Display overlay thickness multiplier for the final layout (default ×2).
 - **Active ROI spotlight:** active ROI id is circled on the reference view for clarity.
@@ -190,7 +190,7 @@ python compare.py \
 - `--pair`: sequence name for external mode
 - `--columns`: grid columns for per-ROI previews
 - `--magnify`/`--scale`: display-only magnification for grid windows (final preview unscaled; multi-ROI ignores this)
-- `--layout`: final layout preview mode (`left|up|right|bottom`)
+- `--layout`: final layout preview mode (`left|top|right|bottom`)
 - `--preview`: image key used in final preview (method name or `GT`/`input` if present)
 - `--mode`: startup interaction mode (`selection|position|idle`)
 - `--output`: root output directory
@@ -206,7 +206,7 @@ python compare.py \
 - `1–9`: add/select ROI by ID; pressing the active ROI id again enters selection mode.
 - `Shift+1–9`: if the target ROI id does not exist, duplicate the active ROI into that id; if it exists, copy the active ROI’s size to the target ROI (center preserved).
 - `d`: add a new ROI with the same size as the current active ROI (uses the smallest unused ID).
-- Arrow keys: set layout (`← left`, `↑ up`, `→ right`, `↓ bottom`).
+- Arrow keys: set layout (`← left`, `↑ top`, `→ right`, `↓ bottom`).
 - `z` / `y`: undo / redo the last action (ROI edits, layout or frame changes, etc.).
 - `Enter`: switch dataset or group/dataset (typed as `group/dataset`).
 - `Space`: jump to an image by name (stem or filename); logs if missing.
@@ -215,6 +215,34 @@ python compare.py \
 - `i`: idle toggle (hide/show grids).
 - `r`: clear all ROIs.
 - `q` or `Esc`: quit.
+
+## 🖼️ Quick tutorial
+
+short walkthrough showing ROI selection.
+
+<img src="figures/basic_op_video.gif" style="width: 100%;">
+
+Basic ROI operations:
+
+| Select ROI                                  | Move ROI                                | Add ROI                                    |
+|---------------------------------------------|-----------------------------------------|--------------------------------------------|
+| ![Select ROI](figures/select_crop_area.png) | ![Move ROI](figures/move_crop_area.png) | ![Add ROI](figures/add_more_crop_area.png) |
+
+| Reselect ROI                                    | Delete ROI                                  |
+|-------------------------------------------------|---------------------------------------------|
+| ![Reselect ROI](figures/reselect_crop_area.png) | ![Delete ROI](figures/delete_crop_area.png) |
+
+More flexible layout directions:
+
+| Layout left                                 | Layout right                                  | Layout top                               | Layout bottom                                   |
+|---------------------------------------------|-----------------------------------------------|------------------------------------------|-------------------------------------------------|
+| ![Layout left](figures/layout_left_img.png) | ![Layout right](figures/layout_right_img.png) | ![Layout top](figures/layout_top_img.png) | ![Layout bottom](figures/layout_bottom_img.png) |
+
+More layout options:
+
+| Single ROI (one)                      | Two ROIs                              | Three ROIs                                | More than three ROIs                    |
+|---------------------------------------|---------------------------------------|-------------------------------------------|-----------------------------------------|
+| ![Layout one](figures/layout_one.png) | ![Layout two](figures/layout_two.png) | ![Layout three](figures/layout_three.png) | ![Layout more](figures/layout_more.png) |
 
 ## 💾 Saving Structure
 On save (`s`), outputs are written to:
