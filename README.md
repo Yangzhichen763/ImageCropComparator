@@ -1,10 +1,10 @@
 &nbsp;
 
-<p align="center"> <img src="figures/logo.png" width="100%" alt="Image Crop Comparator (AI generated logo)"> </p>
+[//]: # (<p align="center"> <img src="figures/logo.png" width="100%" alt="Image Crop Comparator &#40;AI generated logo&#41;"> </p>)
 
 # ✨ Image Crop Comparator
 
-A research-oriented, interactive image crop comparator for pixel-level method analysis, designed for a fast and flexible interactive workflow with multi-ROI selection, automatic layout arrangement, and rich customization options.
+Image Crop Comparator (ICC): A research-oriented, interactive image crop comparator for pixel-level method analysis, designed for a fast and flexible interactive workflow with multi-ROI selection, automatic layout arrangement, and rich customization options.
 
 <div align="center">
 
@@ -15,18 +15,17 @@ A research-oriented, interactive image crop comparator for pixel-level method an
 ## 📌 Overview
 
 ### ✨ Features
-- Fast and flexible ROI-based visual comparison for image restoration (or other else) tasks
-- Keyboard- and mouse-driven multi-ROI selection with undo / redo
-- Automatic and strict layout arrangement (left / right / top / bottom)
-- Support for multiple workspace structures and external timeline datasets
-- Highly customizable CLI for future research
+- ROI-based visual comparison for image restoration (or other else) tasks
+- Fast and flexible multi-ROI selection via keyboard and mouse, with undo/redo support
+- Automatic layout arrangement (left / right / top / bottom)
+- Support for multiple workspace structures
+- Highly customizable CLI for future research, and a user-friendly Web interface (gradio) for improved usability
 
-### 🚧 Checklist
+### 🆕 News 
 
-- [x] Provide a runnable command-line (CLI) tool, including local/external sources, ROI selection, layout preview, and export.
-- [x] Add a [basic tutorial](#workflows). 
-- [ ] Build a Gradio version and migrate to Hugging Face Spaces.
-- [ ] Clean up and document the codebase. Refactor for readability, reduce duplication, and improve maintainability.
+- **2025.12.30** A quick demo of our tool is available on [Hugging Face](). 🤗
+- **2025.12.29** Update [basic tutorial](#workflows). 🧾
+- **2025.12.27** Update ICC-CLI original-version, a runnable command-line (CLI) tool, including local/external sources, ROI selection, layout preview, and export. The compatible. 🎈
 
 ## 📑 Contents
 - 🚀 Getting Started
