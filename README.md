@@ -8,7 +8,7 @@ Image Crop Comparator (ICC): A research-oriented, interactive image crop compara
 
 <div align="center">
 
-[![Gradio Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Gradio%20-Spaces-violet)](https://huggingface.co/spaces/OrangeC4709/ImageCropComparator)
+[![Gradio Spaces Demo](https://img.shields.io/badge/%F0%9F%A4%97%20Gradio%20-Demo-violet)](https://huggingface.co/spaces/OrangeC4709/ImageCropComparator)
 
 </div>
 
@@ -24,19 +24,21 @@ Image Crop Comparator (ICC): A research-oriented, interactive image crop compara
 ### 🆕 News 
 
 - **2025.12.30** A quick demo of our tool is available on [Hugging Face](https://huggingface.co/spaces/OrangeC4709/ImageCropComparator). 🤗
+- **2025.12.30** Update Web version, a Gradio-based UI, providing better user experience for broader users. 🚀
 - **2025.12.29** Update [basic tutorial](#workflows). 🧾
-- **2025.12.27** Update ICC-CLI original-version, a runnable command-line (CLI) tool, including local/external sources, ROI selection, layout preview, and export. The compatible. 🎈
+- **2025.12.28** Update ICC-CLI original-version, a runnable command-line (CLI) tool, including local/external sources, ROI selection, layout preview, and export. The compatible. 🎈
 
 ## 📑 Contents
 - 🚀 Getting Started
   - [Installation](#installation)
-  - [Quick Start](#quick-start)
+  - [Quick Start (CLI)](#quick-start)
+  - [Quick Start (Gradio)](#quick-start-gradio)
   - [Workspace Layout](#workspace-layout)
-- 🧭 User Guide
-  - [Workflows](#workflows)
+- 🧭 User Guidance
+  - [Tutorials](#tutorials)
   - [Interaction](#interaction)
   - [Usage](#usage)
-  - [Saving](#saving)
+  - [Output](#output)
 - ⚙️ Reference
   - [CLI Options](#cli-options)
   - [Logs](#logs)
@@ -72,10 +74,19 @@ pip install -r requirements.txt
 </details>
 
 <a id="quick-start"></a>
-### 🚀 Quick Start
+### 🚀 Quick Start (CLI)
 ```bash
 python compare.py
 ```
+- Local mode (default) expects the example datasets under `examples/`; adjust `Root`/`Structure` in the UI if using your own layout.
+
+<a id="quick-start-gradio"></a>
+### 🚀 Quick Start (Gradio)
+```bash
+python gradio_app.py
+```
+- Runs the Gradio UI locally on http://127.0.0.1:7860/ by default.
+- Local mode (default) expects the example datasets under `examples/`; adjust `Root`/`Structure` in the UI if using your own layout.
 
 <a id="workspace-layout"></a>
 ### 🗂️ Workspace Layout
@@ -219,10 +230,10 @@ examples/         # <root>
 
 </details>
 
-## 🧭 User Guide
+## 🧭 User Guidance
 
-<a id="workflows"></a>
-### 🧪 Workflows
+<a id="tutorials"></a>
+### 🧪 Tutorials
 <details open>
 <summary>Quick tutorial</summary>
 
@@ -377,8 +388,8 @@ python compare.py --source external --dataset SDSD-indoor --pair pair13 --layout
 </details>
 
 
-<a id="saving"></a>
-### 💾 Saving
+<a id="output"></a>
+### 💾 Output
 On `s`, outputs are written to:
 
 ```
@@ -399,22 +410,38 @@ Each method writes its own originals, composed final previews, and all crops for
 
 <a id="troubleshooting"></a>
 ### 🛠️ Troubleshooting
-- "Folder has no images": check dataset path and image extensions.
-- "timeline_methods.txt is required": needed for `--source external`.
-- GUI not responsive: ensure OpenCV GUI support; on headless servers use a local machine or X-forwarding.
 
-## 🤝 Community
+**Issue:**
+```
+cv2.error: OpenCV(4.7.0) /io/opencv/modules/highgui/src/window.cpp:1266: error: (-2:Unspecified error) The function is not implemented. Rebuild the library with Windows, GTK+ 2.x or Cocoa support. If you are on Ubuntu or Debian, install libgtk2.0-dev and pkg-config, then re-run cmake or configure script in function 'cvDestroyAllWindows'
+```
+**Solution:**
 
-<a id="contributing"></a>
-### 🤝 Contributing
+1. uninstall `opencv-python-headless` and reinstall `opencv-python`:
+    ```bash
+    pip uninstall opencv-python-headless
+    pip install "opencv-python==4.7.*"
+    ```
+2. If operation system is Linux, ensure GTK is installed:
+    ```bash
+    sudo apt-get install libgtk2.0-dev pkg-config
+    ```
 
-Contributions are welcome!
+---
 
-- Please open an issue for bugs or feature requests.
-- For major changes, discuss first via an issue.
-- Keep PRs focused and well-documented.
-- Follow existing code style and naming conventions.
+[//]: # (## 🤝 Community)
 
-<a id="acknowledgements"></a>
-### 🙏 Acknowledgements
-Built for fast LLIE evaluation workflows.
+[//]: # ()
+[//]: # (<a id="contributing"></a>)
+
+[//]: # (### 🤝 Contributing)
+
+[//]: # ()
+[//]: # (We welcome contributions of all kinds, including bug reports, feature requests, documentation improvements, and code contributions.)
+
+[//]: # ()
+[//]: # (<a id="acknowledgements"></a>)
+
+[//]: # (### 🙏 Acknowledgements)
+
+[//]: # (We thank all contributors and users who help improve this project through feedback, discussions, and code contributions.)

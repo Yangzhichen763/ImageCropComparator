@@ -1048,9 +1048,24 @@ def build_demo() -> gr.Blocks:
                     )
 
                 with gr.Row():
-                    group = _mk(gr.Textbox, value="SDSD-indoor+", label="Group", info="Group folder under each method (local mode).")
-                    dataset = _mk(gr.Textbox, value="SDSD-indoor", label="Dataset", info="Dataset folder name; also used for saving label.")
-                    pair = _mk(gr.Textbox, value="pair13", label="Pair (external)", info="Sequence name for external datasets (ignored in local mode).")
+                    group = _mk(
+                        gr.Textbox,
+                        value="SDSD-indoor+",
+                        label="Group",
+                        info="Group folder under each method (local mode).",
+                    )
+                    dataset = _mk(
+                        gr.Textbox,
+                        value="SDSD-indoor",
+                        label="Dataset",
+                        info="Dataset folder name; also used for saving label.",
+                    )
+                    pair = _mk(
+                        gr.Textbox,
+                        value="pair13",
+                        label="Pair (external)",
+                        info="Sequence name for external datasets (ignored in local mode).",
+                    )
 
                 with gr.Row():
                     load_btn = _mk(
@@ -1165,14 +1180,24 @@ def build_demo() -> gr.Blocks:
                             layout_bg_color = _mk(gr.Textbox, value="transparent", label="Layout BG Color", info="Padding color between blocks: transparent or R,G,B[,A].")
                         with gr.Row():
                             layout_gap = _mk(gr.Slider, minimum=0, maximum=50, value=10, step=1, label="Layout Gap", info="Spacing between base image and crops (and between crops).")
-                            layout_border_scale = _mk(gr.Slider, minimum=0.5, maximum=6.0, value=2.0, step=0.1, label="Layout Border Scale", info="Border thickness multiplier for crop blocks in final preview.")
+                            layout_border_scale = _mk(gr.Slider, minimum=0.5, maximum=10.0, value=2.0, step=0.1, label="Layout Border Scale", info="Border thickness multiplier for crop blocks in final preview.")
 
         # (ROIs panel moved under Controls)
         with gr.Group():
             gr.Markdown("**💾 Export**")
             with gr.Row():
-                output_dir = _mk(gr.Textbox, value="./.crop_grid/", label="Output Dir", info="Export root directory. Save Outputs writes results under this folder.")
-                save_label = _mk(gr.Textbox, value="", label="Save Label (optional)", info="Override save label (defaults to dataset in local mode, pair in external mode).")
+                output_dir = _mk(
+                    gr.Textbox,
+                    value="./.crop_grid/",
+                    label="Output Dir",
+                    info="Export root directory. Save Outputs writes results under this folder.",
+                )
+                save_label = _mk(
+                    gr.Textbox,
+                    value="",
+                    label="Save Label (optional)",
+                    info="Override save label (defaults to dataset in local mode, pair in external mode).",
+                )
             with gr.Row():
                 # Full-width action button
                 save_btn = _mk(
