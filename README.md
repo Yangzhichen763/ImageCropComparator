@@ -1,6 +1,6 @@
 &nbsp;
 
-[//]: # (<p align="center"> <img src="figures/logo.png" width="100%" alt="Image Crop Comparator &#40;AI generated logo&#41;"> </p>)
+<p align="center"> <img src="figures/layout_more.png" width="100%" alt="Image Crop Comparator &#40;AI generated logo&#41;"> </p>
 
 # ✨ Image Crop Comparator
 
@@ -8,7 +8,7 @@ Image Crop Comparator (ICC): A research-oriented, interactive image crop compara
 
 <div align="center">
 
-[![Gradio Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Gradio%20-Spaces-violet)]()
+[![Gradio Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Gradio%20-Spaces-violet)](https://huggingface.co/spaces/OrangeC4709/ImageCropComparator)
 
 </div>
 
@@ -23,7 +23,7 @@ Image Crop Comparator (ICC): A research-oriented, interactive image crop compara
 
 ### 🆕 News 
 
-- **2025.12.30** A quick demo of our tool is available on [Hugging Face](). 🤗
+- **2025.12.30** A quick demo of our tool is available on [Hugging Face](https://huggingface.co/spaces/OrangeC4709/ImageCropComparator). 🤗
 - **2025.12.29** Update [basic tutorial](#workflows). 🧾
 - **2025.12.27** Update ICC-CLI original-version, a runnable command-line (CLI) tool, including local/external sources, ROI selection, layout preview, and export. The compatible. 🎈
 
@@ -257,9 +257,9 @@ Short walkthrough showing ROI selection.
 <details>
 <summary>Layout capacities</summary>
 
-| Single ROI (one)                      | Two ROIs                              | Three ROIs                                | More than three ROIs                    |
-|---------------------------------------|---------------------------------------|-------------------------------------------|-----------------------------------------|
-| ![Layout one](figures/layout_one.png) | ![Layout two](figures/layout_two.png) | ![Layout three](figures/layout_three.png) | ![Layout more](figures/layout_more.png) |
+| Single ROI (one)                     | Two ROIs                              | Three ROIs                                | More than three ROIs                      |
+|--------------------------------------|---------------------------------------|-------------------------------------------|-------------------------------------------|
+| ![Layout one](figures/layout_one.png) | ![Layout two](figures/layout_two.png) | ![Layout three](figures/layout_three.png) | ![Layout more](figures/layout_more.png)   |
 
 </details>
 
