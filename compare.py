@@ -1191,8 +1191,9 @@ class InteractiveCropComparator:
         grids = []
         gap = self.grid_gap
         for rid, r in valid_rois:
-            header = f"ROI {rid}"
-            g = self.build_grid_for_rect(r['rect'], header_text=header)
+            # header = f"ROI {rid}"
+            # g = self.build_grid_for_rect(r['rect'], header_text=header)
+            g = self.build_grid_for_rect(r['rect'])
             if g is not None:
                 grids.append(g)
         if len(grids) == 0:
@@ -1408,7 +1409,7 @@ class InteractiveCropComparator:
                     heights_scaled.append(h0)
                     resized0.append(img0)
                 Hp = sum(heights_scaled)
-                s_global = (H - inner_pad) / max(Hp, 1)
+                s_global = (H - inner_pad * (len(resized0) - 1 if len(resized0) > 0 else 0)) / max(Hp, 1)
                 resized = []
                 for img0 in resized0:
                     h0, w0 = img0.shape[:2]
@@ -1478,7 +1479,7 @@ class InteractiveCropComparator:
                     widths_scaled.append(w0)
                     resized0.append(img0)
                 Wp = sum(widths_scaled)
-                s_global = (W - inner_pad) / max(Wp, 1)
+                s_global = (W - inner_pad * (len(resized0) - 1 if len(resized0) > 0 else 0)) / max(Wp, 1)
                 resized = []
                 for img0 in resized0:
                     h0, w0 = img0.shape[:2]
