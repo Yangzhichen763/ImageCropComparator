@@ -365,6 +365,7 @@ def ui_load(
     pair: str,
     structure: str,
     roi_file: str,
+    compose_layout: bool,
     output_dir: str,
     columns: int,
     grid_gap: int,
@@ -392,6 +393,7 @@ def ui_load(
         layout_border_scale=layout_border_scale,
         layout_gap=layout_gap,
         layout_bg_color=bg,
+        compose_layout=compose_layout if compose_layout is not None else True,
         current_group=group,
         current_dataset=dataset,
     )
@@ -573,6 +575,7 @@ def ui_apply_final_settings(
     sess: _Session,
     preview_key: str,
     layout: str,
+    compose_layout: bool,
     layout_gap: int,
     layout_border_scale: float,
     layout_bg_color: str,
@@ -583,6 +586,10 @@ def ui_apply_final_settings(
     cmp_ = sess.comparator
     try:
         cmp_.layout_mode = layout
+    except Exception:
+        pass
+    try:
+        cmp_.compose_layout = bool(compose_layout)
     except Exception:
         pass
     try:
@@ -645,6 +652,7 @@ def ui_apply_settings(
     magnify: float,
     thickness: int,
     layout: str,
+    compose_layout: bool,
     layout_gap: int,
     layout_border_scale: float,
     layout_bg_color: str,
@@ -673,6 +681,10 @@ def ui_apply_settings(
         pass
     try:
         cmp_.layout_mode = layout
+    except Exception:
+        pass
+    try:
+        cmp_.compose_layout = bool(compose_layout)
     except Exception:
         pass
     try:
@@ -1193,6 +1205,7 @@ def build_demo() -> gr.Blocks:
                     with gr.Accordion("🧷 Final Layout Preview Settings", open=True):
                         with gr.Row():
                             layout = _mk(gr.Dropdown, choices=["left", "top", "right", "bottom"], value="right", label="Layout", info="Where crops are placed relative to the base image.")
+                            compose_layout = _mk(gr.Checkbox, value=True, label="Compose crops beside reference", info="When off, Final Preview shows only the reference image with ROI boxes.")
                             layout_bg_color = _mk(gr.Textbox, value="transparent", label="Layout BG Color", info="Padding color between blocks: transparent or R,G,B[,A].")
                         with gr.Row():
                             layout_gap = _mk(gr.Slider, minimum=0, maximum=50, value=10, step=1, label="Layout Gap", info="Spacing between base image and crops (and between crops).")
@@ -1236,6 +1249,7 @@ def build_demo() -> gr.Blocks:
                 pair,
                 structure,
                 roi_file,
+                compose_layout,
                 output_dir,
                 columns,
                 grid_gap,
@@ -1307,22 +1321,27 @@ def build_demo() -> gr.Blocks:
         # - Final layout settings: update final preview only
         layout.change(
             fn=ui_apply_final_settings,
-            inputs=[sess_state, preview_key_dd, layout, layout_gap, layout_border_scale, layout_bg_color],
+            inputs=[sess_state, preview_key_dd, layout, compose_layout, layout_gap, layout_border_scale, layout_bg_color],
             outputs=[final_img, status],
         )
         layout_bg_color.change(
             fn=ui_apply_final_settings,
-            inputs=[sess_state, preview_key_dd, layout, layout_gap, layout_border_scale, layout_bg_color],
+            inputs=[sess_state, preview_key_dd, layout, compose_layout, layout_gap, layout_border_scale, layout_bg_color],
             outputs=[final_img, status],
         )
         layout_gap.release(
             fn=ui_apply_final_settings,
-            inputs=[sess_state, preview_key_dd, layout, layout_gap, layout_border_scale, layout_bg_color],
+            inputs=[sess_state, preview_key_dd, layout, compose_layout, layout_gap, layout_border_scale, layout_bg_color],
             outputs=[final_img, status],
         )
         layout_border_scale.release(
             fn=ui_apply_final_settings,
-            inputs=[sess_state, preview_key_dd, layout, layout_gap, layout_border_scale, layout_bg_color],
+            inputs=[sess_state, preview_key_dd, layout, compose_layout, layout_gap, layout_border_scale, layout_bg_color],
+            outputs=[final_img, status],
+        )
+        compose_layout.change(
+            fn=ui_apply_final_settings,
+            inputs=[sess_state, preview_key_dd, layout, compose_layout, layout_gap, layout_border_scale, layout_bg_color],
             outputs=[final_img, status],
         )
 

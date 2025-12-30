@@ -9,6 +9,8 @@ from glob import glob
 import cv2
 import numpy as np
 
+from typing import Union, Tuple
+
 try:
     from natsort import natsorted as _natsorted
 except Exception:  # pragma: no cover - optional dependency
@@ -306,8 +308,9 @@ class InteractiveCropComparator:
             line_thickness=5,
             layout_border_scale=2.0,
             layout_gap=10,
-            layout_bg_color: str | tuple='transparent',
+            layout_bg_color: Union[str, Tuple] = 'transparent',
             layout_min_scale=1.0,
+            compose_layout: bool = True,
             current_group=None,
             current_dataset=None,
             method_roots=None,
@@ -434,6 +437,7 @@ class InteractiveCropComparator:
         self.sort_mode = 'position'  # 'position' | 'id'
         self.sort_reverse = False
         self.preview_key = reference_key
+        self.compose_layout = bool(compose_layout)
         self.save_session_ts = None
         self.undo_manager = UndoManager()
         self.dispatcher = EventDispatcher()
@@ -1217,6 +1221,15 @@ class InteractiveCropComparator:
         ref = self._to_canvas_image(ref)
         H, W = ref.shape[:2]
         valid = [(rid, r) for rid, r in sorted(self.rois.items()) if r['rect'] is not None]
+        if not getattr(self, 'compose_layout', True):
+            if len(valid) == 0:
+                return ref.copy()
+            out = ref.copy()
+            for rid, r in valid:
+                x1, y1, x2, y2 = self.clamp_rect(r['rect'])
+                color = self._color_with_alpha(r['color'])
+                cv2.rectangle(out, (x1, y1), (x2, y2), color, self.line_thickness)
+            return out
         # Determine sorting strategy
         eff_sort_mode = (sort_mode or self.sort_mode).lower()
         eff_reverse = bool(reverse_sort or self.sort_reverse)
@@ -1878,6 +1891,10 @@ if __name__ == "__main__":
                         help='Folder structure layout: auto (default), group-dataset-pair, group-dataset, dataset-only, flat (images directly under method), or shared (image-id folders containing per-method files such as img1/methodA.png).')
     parser.add_argument('--roi-file', default=None, type=str,
                         help='Optional ROI txt file to preload; format per line: id x1 y1 x2 y2.')
+    parser.add_argument('--compose-layout', dest='compose_layout', action='store_true', default=True,
+                        help='Enable side-by-side crop composition in the final layout (default: on).')
+    parser.add_argument('--no-compose-layout', dest='compose_layout', action='store_false',
+                        help='Disable composition; final layout shows only the reference image with ROI boxes.')
     parser.add_argument('--no-color', action='store_true',
                         help='Disable ANSI colored logs (use plain text).')
     parser.add_argument('--log-level', default='info', choices=['debug', 'info', 'warn', 'error'],
@@ -1982,6 +1999,7 @@ if __name__ == "__main__":
         layout_border_scale=args.layout_border_scale,
         layout_gap=args.layout_gap,
         layout_bg_color=layout_bg_color,
+        compose_layout=args.compose_layout,
         current_group=args.group,
         current_dataset=dataset,
     )
