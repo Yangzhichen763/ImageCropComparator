@@ -1610,6 +1610,79 @@ class InteractiveCropComparator:
                 cv2.imshow(self.window_final, final_view)
         self.needs_update = False
 
+    def _serialize_rois(self):
+        """Return ordered ROI tuples (id, x1, y1, x2, y2)."""
+        entries = []
+        for rid, r in sorted(self.rois.items()):
+            rect = r.get('rect')
+            if rect is None:
+                continue
+            x1, y1, x2, y2 = self.clamp_rect(rect)
+            entries.append((rid, x1, y1, x2, y2))
+        return entries
+
+    def save_rois_to_txt(self, out_path):
+        entries = self._serialize_rois()
+        try:
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write("# roi_id x1 y1 x2 y2\n")
+                for rid, x1, y1, x2, y2 in entries:
+                    f.write(f"{rid} {x1} {y1} {x2} {y2}\n")
+                if not entries:
+                    f.write("# no roi defined\n")
+            if entries:
+                log.success(f"Saved ROI info to {out_path}")
+            else:
+                log.warn(f"Saved empty ROI info to {out_path}")
+            return True
+        except Exception as e:
+            log.error(f"Failed to save ROI info: {e}")
+            return False
+
+    def load_rois_from_txt(self, path):
+        if not path:
+            return False
+        if not os.path.exists(path):
+            log.error(f"ROI file not found: {path}")
+            return False
+        loaded = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.replace(',', ' ').split()
+                    if len(parts) < 5:
+                        continue
+                    try:
+                        rid = int(parts[0])
+                        x1, y1, x2, y2 = [int(float(v)) for v in parts[1:5]]
+                        loaded.append((rid, (x1, y1, x2, y2)))
+                    except Exception:
+                        continue
+        except Exception as e:
+            log.error(f"Failed to read ROI file {path}: {e}")
+            return False
+
+        if not loaded:
+            log.warn(f"ROI file {path} has no valid entries")
+            return False
+
+        self.rois = {}
+        for rid, rect in loaded:
+            x1, y1, x2, y2 = self.clamp_rect(rect)
+            self.rois[rid] = {'rect': (x1, y1, x2, y2), 'color': self.color_for_id(rid)}
+        self.active_roi = loaded[0][0]
+        self.mode = 'position'
+        self.selection_start = None
+        self.undo_manager.undo_stack.clear()
+        self.undo_manager.redo_stack.clear()
+        self.request_update()
+        log.success(f"Loaded {len(loaded)} ROIs from {path}")
+        return True
+
     def save(self, pair, dataset):
         # Prepare timestamped output directory: output/<timestamp>/<dataset>/
         if self.save_session_ts is None:
@@ -1663,6 +1736,13 @@ class InteractiveCropComparator:
                 crop = img[y1:y2, x1:x2]
                 crop_out = os.path.join(m_dir, f"crop_roi{rid}_{m}.png")
                 cv2.imwrite(crop_out, crop)
+        try:
+            ref_file = self.image_files[self.reference_key][self.current_frame]
+            ref_stem = os.path.basename(ref_file).rsplit('.', 1)[0]
+            roi_out = os.path.join(base_dir, f"roi_{ref_stem}.txt")
+        except Exception:
+            roi_out = os.path.join(base_dir, "roi_info.txt")
+        self.save_rois_to_txt(roi_out)
         log.success(f"Saved outputs under: {base_dir}")
 
     def run(self, pair):
@@ -1796,6 +1876,8 @@ if __name__ == "__main__":
                         help='Padding/background color as R,G,B[,A] for final layout gaps, or "transparent" (default). e.g., 0,0,0 or 255,255,255,255.')
     parser.add_argument('--structure', default='auto', choices=['auto', 'group-dataset-pair', 'group-dataset', 'dataset-only', 'flat', 'shared'],
                         help='Folder structure layout: auto (default), group-dataset-pair, group-dataset, dataset-only, flat (images directly under method), or shared (image-id folders containing per-method files such as img1/methodA.png).')
+    parser.add_argument('--roi-file', default=None, type=str,
+                        help='Optional ROI txt file to preload; format per line: id x1 y1 x2 y2.')
     parser.add_argument('--no-color', action='store_true',
                         help='Disable ANSI colored logs (use plain text).')
     parser.add_argument('--log-level', default='info', choices=['debug', 'info', 'warn', 'error'],
@@ -1910,6 +1992,9 @@ if __name__ == "__main__":
     # Sorting options for final layout
     comparator.sort_mode = 'id'
     comparator.sort_reverse = False
+    # Optional ROI preload
+    if args.roi_file:
+        comparator.load_rois_from_txt(os.path.expanduser(args.roi_file))
     # Log summary of loaded data
     try:
         shared_layout = any(isinstance(v, (list, tuple)) for v in input_folder.values())

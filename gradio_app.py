@@ -30,6 +30,7 @@ def _parse_bg_color(layout_bg_color: str) -> tuple:
     try:
         if isinstance(layout_bg_color, str) and layout_bg_color.strip().lower() != "transparent":
             parts = [int(x) for x in layout_bg_color.replace(' ', '').split(',') if x != '']
+            print(parts)
             if len(parts) not in (3, 4):
                 raise ValueError
             return tuple(max(0, min(255, v)) for v in parts)
@@ -363,6 +364,7 @@ def ui_load(
     dataset: str,
     pair: str,
     structure: str,
+    roi_file: str,
     output_dir: str,
     columns: int,
     grid_gap: int,
@@ -400,6 +402,12 @@ def ui_load(
     if len(cmp_.rois) == 0:
         cmp_.add_roi(1)
 
+    roi_note = ""
+    roi_path = (roi_file or "").strip()
+    if roi_path:
+        ok = cmp_.load_rois_from_txt(os.path.expanduser(roi_path))
+        roi_note = f" Loaded ROIs from {roi_path}." if ok else f" Failed to load ROIs from {roi_path}."
+
     sess = _Session(
         comparator=cmp_,
         source=source,
@@ -418,7 +426,7 @@ def ui_load(
     preview_default = 'GT' if 'GT' in methods else (sess.reference_key if sess.reference_key in methods else methods[0])
 
     ref_img, grid_img, final_img, roi_table = _render_outputs(sess, preview_default)
-    status = f"Loaded {len(methods)} methods, {len(frames)} frames (reference={sess.reference_key})."
+    status = f"Loaded {len(methods)} methods, {len(frames)} frames (reference={sess.reference_key}).{roi_note}"
 
     root_u, group_u, dataset_u, pair_u, structure_u = ui_update_param_relevance(sess, source, root, group, dataset, pair, structure)
 
@@ -1068,6 +1076,14 @@ def build_demo() -> gr.Blocks:
                     )
 
                 with gr.Row():
+                    roi_file = _mk(
+                        gr.Textbox,
+                        value="",
+                        label="ROI File (optional)",
+                        info="Path to ROI txt (id x1 y1 x2 y2). Loaded on Load.",
+                    )
+
+                with gr.Row():
                     load_btn = _mk(
                         gr.Button,
                         value="Load",
@@ -1219,6 +1235,7 @@ def build_demo() -> gr.Blocks:
                 dataset,
                 pair,
                 structure,
+                roi_file,
                 output_dir,
                 columns,
                 grid_gap,
