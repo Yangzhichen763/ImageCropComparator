@@ -2,7 +2,7 @@
 
 <p align="center"> <img src="figures/layout_more.png" width="100%" alt="Image Crop Comparator &#40;AI generated logo&#41;"> </p>
 
-# ✨ Image Crop Comparator
+# ✨ Image Crop Comparator 
 
 Image Crop Comparator (ICC): A research-oriented, interactive image crop comparator for pixel-level method analysis, designed for a fast and flexible interactive workflow with multi-ROI selection, automatic layout arrangement, and rich customization options.
 
@@ -12,45 +12,59 @@ Image Crop Comparator (ICC): A research-oriented, interactive image crop compara
 
 </div>
 
-## 📌 Overview
+<details>
+<summary>Image Crop Comparator Demo</summary>
 
-### ✨ Features
-- ROI-based visual comparison for image restoration (or other else) tasks
+![Image Crop Comparator Demo](figures/gradio_page.png)
+
+</details>
+
+## Overview 📌
+
+### Features ✨
+- ROI-based multi-image previewer for image restoration (or other else) tasks
 - Fast and flexible multi-ROI selection via keyboard and mouse, with undo/redo support
 - Automatic layout arrangement (left / right / top / bottom)
 - Support for multiple workspace structures
 - Highly customizable CLI for future research, and a user-friendly Web interface (gradio) for improved usability
 
-### 🆕 News 
+### News 🆕 
 
 - **2025.12.30** A quick demo of our tool is available on [Hugging Face](https://huggingface.co/spaces/OrangeC4709/ImageCropComparator). 🤗
 - **2025.12.30** Update Web version, a Gradio-based UI, providing better user experience for broader users. 🚀
 - **2025.12.29** Update [basic tutorial](#workflows). 🧾
 - **2025.12.28** Update ICC-CLI original-version, a runnable command-line (CLI) tool, including local/external sources, ROI selection, layout preview, and export. The compatible. 🎈
 
-## 📑 Contents
-- 🚀 Getting Started
+## Contents 📑 
+- Getting Started 🚀
   - [Installation](#installation)
   - [Quick Start (CLI)](#quick-start)
   - [Quick Start (Gradio)](#quick-start-gradio)
   - [Workspace Layout](#workspace-layout)
-- 🧭 User Guidance
+- User Guidance 🧭
   - [Tutorials](#tutorials)
   - [Interaction](#interaction)
   - [Usage](#usage)
   - [Output](#output)
-- ⚙️ Reference
+- Reference ⚙️ 
   - [CLI Options](#cli-options)
   - [Logs](#logs)
   - [Troubleshooting](#troubleshooting)
-- 🤝 Community
-  - [Contributing](#contributing)
-  - [Acknowledgements](#acknowledgements)
+- Community 🤝 
+  - [Call to Action](#call-to-action)
 
-## 🚀 Getting Started
+[//]: # (- 🤝 Community)
+
+[//]: # (  - [Contributing]&#40;#contributing&#41;)
+
+[//]: # (  - [Acknowledgements]&#40;#acknowledgements&#41;)
+
+[//]: # (  - [Citation]&#40;#citation&#41;)
+
+## Getting Started 🚀
 
 <a id="installation"></a>
-### 🧰 Installation
+### Installation 🧰
 - Python 3.8+
 - [requirements.txt](requirements.txt) pins `opencv-python==4.7.*` and `numpy==1.26.*`; install with `pip install -r requirements.txt`.
 - Packages: opencv-python, numpy, natsort, Pillow
@@ -74,14 +88,14 @@ pip install -r requirements.txt
 </details>
 
 <a id="quick-start"></a>
-### 🚀 Quick Start (CLI)
+### Quick Start (CLI) 🚀
 ```bash
 python compare.py
 ```
 - Local mode (default) expects the example datasets under `examples/`; adjust `Root`/`Structure` in the UI if using your own layout.
 
 <a id="quick-start-gradio"></a>
-### 🚀 Quick Start (Gradio)
+### Quick Start (Gradio) 🚀
 ```bash
 python gradio_app.py
 ```
@@ -89,7 +103,7 @@ python gradio_app.py
 - Local mode (default) expects the example datasets under `examples/`; adjust `Root`/`Structure` in the UI if using your own layout.
 
 <a id="workspace-layout"></a>
-### 🗂️ Workspace Layout
+### Workspace Layout 🗂️
 (for default local source)
 Methods live under the workspace root, and each holds datasets.
 
@@ -230,10 +244,10 @@ examples/         # <root>
 
 </details>
 
-## 🧭 User Guidance
+## User Guidance 🧭
 
 <a id="tutorials"></a>
-### 🧪 Tutorials
+### Tutorials 🧪
 <details open>
 <summary>Quick tutorial</summary>
 
@@ -284,7 +298,7 @@ Optional mouse-only quick tour (all operations by mouse):
 
 
 <a id="interaction"></a>
-### 🎮 Interaction
+### Interaction 🎮
 
 <details open>
 <summary>Keyboard</summary>
@@ -327,7 +341,7 @@ Quick actions:
 
 
 <a id="usage"></a>
-### 🧭 Usage
+### Usage 🧭
 Local images with auto-discovery:
 
 ```bash
@@ -347,7 +361,7 @@ python compare.py --source external --dataset SDSD-indoor --pair pair13 --layout
 
 
 <a id="cli-options"></a>
-### ⚙️ CLI Options
+### CLI Options ⚙️
 <details open>
 <summary>Core switches</summary>
 
@@ -389,7 +403,7 @@ python compare.py --source external --dataset SDSD-indoor --pair pair13 --layout
 
 
 <a id="output"></a>
-### 💾 Output
+### Output 💾
 On `s`, outputs are written to:
 
 ```
@@ -401,15 +415,15 @@ On `s`, outputs are written to:
 
 Each method writes its own originals, composed final previews, and all crops for active ROIs.
 
-## ⚙️ Reference
+## Reference ⚙️
 
 <a id="logs"></a>
-### 🎨 Logs
+### Logs 🎨
 - Linux terminals show colored status messages: info (cyan), success (green), warnings (yellow), errors (red), notes (bright cyan).
 - Toggle with `--no-color`; set verbosity via `--log-level`.
 
 <a id="troubleshooting"></a>
-### 🛠️ Troubleshooting
+### Troubleshooting 🛠️
 
 **Issue:**
 ```
@@ -427,7 +441,10 @@ cv2.error: OpenCV(4.7.0) /io/opencv/modules/highgui/src/window.cpp:1266: error: 
     sudo apt-get install libgtk2.0-dev pkg-config
     ```
 
----
+<a id="call-to-action"></a>
+## Call to Action ⭐
+
+* ⭐ If you like ICC, give it a star. It helps others discover the project and supports its growth.
 
 [//]: # (## 🤝 Community)
 
@@ -445,3 +462,29 @@ cv2.error: OpenCV(4.7.0) /io/opencv/modules/highgui/src/window.cpp:1266: error: 
 [//]: # (### 🙏 Acknowledgements)
 
 [//]: # (We thank all contributors and users who help improve this project through feedback, discussions, and code contributions.)
+
+[//]: # (<a id="citation"></a>)
+
+[//]: # (### 📚 Citation)
+
+[//]: # ()
+[//]: # (This tool is a byproduct of the following research work.  )
+
+[//]: # (If you find **Image Crop Comparator &#40;ICC&#41;** useful for your research or practice, please consider citing:)
+
+[//]: # ()
+[//]: # (```bibtex)
+
+[//]: # (@inproceedings{xu2025urwkv,)
+
+[//]: # (  title     = {URWKV: Unified RWKV Model with Multi-state Perspective for Low-light Image Restoration},)
+
+[//]: # (  author    = {Xu, Rui and Niu, Yuzhen and Li, Yuezhou and Xu, Huangbiao and Liu, Wenxi and Chen, Yuzhong},)
+
+[//]: # (  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition &#40;CVPR&#41;},)
+
+[//]: # (  pages     = {21267--21276},)
+
+[//]: # (  year      = {2025})
+
+[//]: # (})
