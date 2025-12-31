@@ -18,6 +18,16 @@ except Exception:  # pragma: no cover - optional dependency
 
 IMG_EXTS = ['png', 'jpg', 'jpeg']
 
+
+def is_hidden_path(path):
+    parts = os.path.normpath(path or '').split(os.sep)
+    return any(part.startswith('.') for part in parts if part not in ('', '.', '..'))
+
+
+def filter_hidden(paths):
+    return [p for p in paths if not is_hidden_path(p)]
+
+
 sys.path.append('.')
 sys.path.append('..')
 
@@ -92,11 +102,12 @@ except Exception:
     def glob_single_files(directory, file_extensions, path_handler=PathHandler.get_vanilla_path):
         if isinstance(file_extensions, str):
             file_extensions = [file_extensions]
-        file_paths = []
+        raw_paths = []
         for file_extension in file_extensions:
             pattern = os.path.join(directory, f"**/*.{file_extension}")
-            file_paths += _natsorted(glob(pattern, recursive=True))
-        file_paths = [path_handler(os.path.normpath(path)) for path in file_paths]
+            raw_paths += _natsorted(glob(pattern, recursive=True))
+        raw_paths = [os.path.normpath(path) for path in raw_paths]
+        file_paths = [path_handler(path) for path in raw_paths if not is_hidden_path(path)]
         return file_paths
 
 
@@ -165,7 +176,7 @@ class UndoManager:
 def has_images(directory, exts=None):
     exts = exts or IMG_EXTS
     try:
-        return len(glob_single_files(directory, exts)) > 0
+        return len(filter_hidden(glob_single_files(directory, exts))) > 0
     except Exception:
         return False
 
@@ -177,6 +188,8 @@ def resolve_group_folder(method_root, target_group):
         return None
     try:
         for d in os.listdir(method_root):
+            if d.startswith('.'):
+                continue
             full = os.path.join(method_root, d)
             if not os.path.isdir(full):
                 continue
@@ -241,7 +254,7 @@ def discover_shared_folder_methods(root):
     """
     if not os.path.isdir(root):
         return {}
-    subdirs = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+    subdirs = [d for d in os.listdir(root) if not d.startswith('.') and os.path.isdir(os.path.join(root, d))]
     subdirs = sorted(subdirs)
     if not subdirs:
         return {}
@@ -249,7 +262,7 @@ def discover_shared_folder_methods(root):
     method_names = None
     for sd in subdirs:
         cur = os.path.join(root, sd)
-        files = [f for f in os.listdir(cur) if os.path.isfile(os.path.join(cur, f))]
+        files = [f for f in os.listdir(cur) if not f.startswith('.') and os.path.isfile(os.path.join(cur, f))]
         files = [f for f in files if os.path.splitext(f)[1].lstrip('.').lower() in IMG_EXTS]
         if not files:
             continue
@@ -333,9 +346,9 @@ class InteractiveCropComparator:
         self.image_files = {}
         for name, src in self.input_folders.items():
             if isinstance(src, (list, tuple)):
-                files = list(src)
+                files = filter_hidden(list(src))
             else:
-                files = glob_single_files(src, IMG_EXTS)
+                files = filter_hidden(glob_single_files(src, IMG_EXTS))
             self.image_files[name] = files
             if name not in self.method_roots:
                 self.method_roots[name] = self._infer_method_root(src, files)
@@ -615,7 +628,8 @@ class InteractiveCropComparator:
         src_rect = self.rois[self.active_roi]['rect']
         new_id = self.add_roi()
         self.rois[new_id]['rect'] = src_rect
-        log.success(f"Added ROI {log.style_num(str(new_id))} with the same size as ROI {log.style_num(str(self.active_roi))}")
+        log.success(
+            f"Added ROI {log.style_num(str(new_id))} with the same size as ROI {log.style_num(str(self.active_roi))}")
         self.set_active_roi(new_id, to_selection=False)
         self._record_rois_change("duplicate roi", before=before)
         self.request_update()
@@ -773,7 +787,7 @@ class InteractiveCropComparator:
             if not os.path.exists(cand):
                 log.warn(f"Missing folder for {log.style_path(name)} at {log.style_path(cand)}")
                 continue
-            imgs = glob_single_files(cand, ['png', 'jpg', 'jpeg'])
+            imgs = filter_hidden(glob_single_files(cand, ['png', 'jpg', 'jpeg']))
             if len(imgs) == 0:
                 log.warn(f"No images in {log.style_path(cand)} for {log.style_path(name)}")
                 continue
@@ -787,7 +801,8 @@ class InteractiveCropComparator:
         self.input_folders = new_inputs
         self.group = new_group
         self.dataset = new_dataset
-        self.image_files = {name: glob_single_files(path, ['png', 'jpg', 'jpeg']) for name, path in new_inputs.items()}
+        self.image_files = {name: filter_hidden(glob_single_files(path, ['png', 'jpg', 'jpeg'])) for name, path in
+                            new_inputs.items()}
 
         # pick reference key
         keys = list(self.image_files.keys())
@@ -866,6 +881,7 @@ class InteractiveCropComparator:
     def draw_dashed_rect(self, img, pt1, pt2, color, thickness=1, dash_len=6, gap_len=6):
         x1, y1 = pt1
         x2, y2 = pt2
+
         # horizontal lines
         def _draw_dash_line(p1, p2):
             dist = int(max(abs(p2[0] - p1[0]), abs(p2[1] - p1[1])))
@@ -1182,10 +1198,12 @@ class InteractiveCropComparator:
             y0 = row * roi_h + rg
             x0 = col * roi_w + cg
             grid[y0:y0 + roi_h, x0:x0 + roi_w] = crop
-            cv2.putText(grid, name, (x0 + 2, y0 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            cv2.putText(grid, name, (x0 + 2, y0 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1,
+                        lineType=cv2.LINE_AA)
 
         if header_text:
-            cv2.putText(grid, header_text, (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 2)
+            cv2.putText(grid, header_text, (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1,
+                        lineType=cv2.LINE_AA)
         return grid
 
     def build_grid(self):
@@ -1298,6 +1316,7 @@ class InteractiveCropComparator:
         if len(crops) == 0:
             return ref.copy()
         mode = self.layout_mode
+
         # Utility: even split counts for k groups
         def _even_counts(total, k):
             base = total // k
@@ -1334,13 +1353,14 @@ class InteractiveCropComparator:
                         valid = False
                         break
                     s_global = (H - self.layout_gap) / Hp
-                    final_scales = [ (W / max(subset[i].shape[1],1)) * s_global for i in range(len(subset)) ]
+                    final_scales = [(W / max(subset[i].shape[1], 1)) * s_global for i in range(len(subset))]
                     if min(final_scales) < min_scale - 1e-9:
                         valid = False
                         break
                     scale_sum += sum(final_scales)
                     col_w = max(w * s_global for w in w0s)
-                    col_h = sum(h * s_global for h in h0s) + self.layout_gap * (len(subset) - 1 if len(subset) > 0 else 0)
+                    col_h = sum(h * s_global for h in h0s) + self.layout_gap * (
+                        len(subset) - 1 if len(subset) > 0 else 0)
                     col_ws.append(col_w)
                     col_hs.append(col_h)
                 if not valid:
@@ -1382,12 +1402,13 @@ class InteractiveCropComparator:
                         valid = False
                         break
                     s_global = (W - self.layout_gap) / Wp
-                    final_scales = [ (H / max(subset[i].shape[0],1)) * s_global for i in range(len(subset)) ]
+                    final_scales = [(H / max(subset[i].shape[0], 1)) * s_global for i in range(len(subset))]
                     if min(final_scales) < min_scale - 1e-9:
                         valid = False
                         break
                     scale_sum += sum(final_scales)
-                    row_w = sum(w * s_global for w in w0s) + self.layout_gap * (len(subset) - 1 if len(subset) > 0 else 0)
+                    row_w = sum(w * s_global for w in w0s) + self.layout_gap * (
+                        len(subset) - 1 if len(subset) > 0 else 0)
                     row_h = max(h * s_global for h in h0s)
                     row_ws.append(row_w)
                     row_hs.append(row_h)
@@ -1431,7 +1452,8 @@ class InteractiveCropComparator:
                     img1 = cv2.resize(img0, (w1, h1), interpolation=cv2.INTER_NEAREST)
                     resized.append(img1)
                 block_w = max(img.shape[1] for img in resized)
-                block_h = sum(img.shape[0] for img in resized) + inner_pad * (len(resized) - 1 if len(resized) > 0 else 0)
+                block_h = sum(img.shape[0] for img in resized) + inner_pad * (
+                    len(resized) - 1 if len(resized) > 0 else 0)
                 block = self._blank_canvas(block_h, block_w)
                 y = 0
                 for idx_img, img in enumerate(resized):
@@ -1446,7 +1468,8 @@ class InteractiveCropComparator:
                 col_blocks.append(block)
 
             pad = self.layout_gap
-            block_w_total = sum(b.shape[1] for b in col_blocks) + pad * (len(col_blocks) - 1 if len(col_blocks) > 0 else 0)
+            block_w_total = sum(b.shape[1] for b in col_blocks) + pad * (
+                len(col_blocks) - 1 if len(col_blocks) > 0 else 0)
             block_h_total = max(b.shape[0] for b in col_blocks) if col_blocks else 0
             canvas_h = max(H, block_h_total)
             canvas_w = W + block_w_total + pad
@@ -1500,7 +1523,8 @@ class InteractiveCropComparator:
                     h1 = max(1, int(round(h0 * s_global)))
                     img1 = cv2.resize(img0, (w1, h1), interpolation=cv2.INTER_NEAREST)
                     resized.append(img1)
-                block_w = sum(img.shape[1] for img in resized) + inner_pad * (len(resized) - 1 if len(resized) > 0 else 0)
+                block_w = sum(img.shape[1] for img in resized) + inner_pad * (
+                    len(resized) - 1 if len(resized) > 0 else 0)
                 block_h = max(img.shape[0] for img in resized)
                 block = self._blank_canvas(block_h, block_w)
                 x = 0
@@ -1517,7 +1541,8 @@ class InteractiveCropComparator:
 
             pad = self.layout_gap
             block_w_total = max(b.shape[1] for b in row_blocks) if row_blocks else 0
-            block_h_total = sum(b.shape[0] for b in row_blocks) + pad * (len(row_blocks) - 1 if len(row_blocks) > 0 else 0)
+            block_h_total = sum(b.shape[0] for b in row_blocks) + pad * (
+                len(row_blocks) - 1 if len(row_blocks) > 0 else 0)
             canvas_w = max(W, block_w_total)
             canvas_h = H + block_h_total + pad
             out = self._blank_canvas(canvas_h, canvas_w)
@@ -1561,7 +1586,8 @@ class InteractiveCropComparator:
                     cy = max(20, y1 - 20)
                     self.draw_circled_label(canvas, (cx, cy), rid, r['color'])
                 else:
-                    cv2.putText(canvas, f"{rid}", (x1 + 3, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, r['color'], 2)
+                    cv2.putText(canvas, f"{rid}", (x1 + 3, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, r['color'],
+                                2)
         # Top-left image name (without extension) for the interactive reference display
         try:
             ref_path = self.image_files[self.reference_key][self.current_frame]
@@ -1575,6 +1601,7 @@ class InteractiveCropComparator:
             blank = np.zeros((min(240, self.height), min(320, self.width), 3), dtype=np.uint8)
             cv2.putText(blank, "Final layout idle", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
             return blank
+
         if self.mode == 'idle':
             for w in list(self.grid_windows):
                 try:
@@ -1595,7 +1622,8 @@ class InteractiveCropComparator:
                 if grid is None:
                     continue
                 if self.display_scale and self.display_scale != 1.0:
-                    grid_view = cv2.resize(grid, dsize=None, fx=self.display_scale, fy=self.display_scale, interpolation=cv2.INTER_NEAREST)
+                    grid_view = cv2.resize(grid, dsize=None, fx=self.display_scale, fy=self.display_scale,
+                                           interpolation=cv2.INTER_NEAREST)
                     cv2.imshow(name, grid_view)
                 else:
                     cv2.imshow(name, grid)
@@ -1611,7 +1639,8 @@ class InteractiveCropComparator:
 
             # Final layout window (preview only shows one image)
             preview_key = self.preview_key or self.reference_key
-            final = self.build_final_layout_for_key(preview_key, sort_mode=self.sort_mode, reverse_sort=self.sort_reverse)
+            final = self.build_final_layout_for_key(preview_key, sort_mode=self.sort_mode,
+                                                    reverse_sort=self.sort_reverse)
             if final is None:
                 blank = final_layout_blank()
                 cv2.imshow(self.window_final, blank)
@@ -1887,7 +1916,8 @@ if __name__ == "__main__":
                         help='Gap (in pixels) between base image and crop block, and between crops themselves (default: 10).')
     parser.add_argument('--layout-bg-color', default='transparent', type=str,
                         help='Padding/background color as R,G,B[,A] for final layout gaps, or "transparent" (default). e.g., 0,0,0 or 255,255,255,255.')
-    parser.add_argument('--structure', default='auto', choices=['auto', 'group-dataset-pair', 'group-dataset', 'dataset-only', 'flat', 'shared'],
+    parser.add_argument('--structure', default='auto',
+                        choices=['auto', 'group-dataset-pair', 'group-dataset', 'dataset-only', 'flat', 'shared'],
                         help='Folder structure layout: auto (default), group-dataset-pair, group-dataset, dataset-only, flat (images directly under method), or shared (image-id folders containing per-method files such as img1/methodA.png).')
     parser.add_argument('--roi-file', default=None, type=str,
                         help='Optional ROI txt file to preload; format per line: id x1 y1 x2 y2.')
@@ -1900,6 +1930,8 @@ if __name__ == "__main__":
     parser.add_argument('--log-level', default='info', choices=['debug', 'info', 'warn', 'error'],
                         help='Logging level: debug|info|warn|error (default: info).')
     args = parser.parse_args()
+
+    output_abs = os.path.abspath(args.output)
 
     pair = args.pair
     group = args.group
@@ -1936,7 +1968,26 @@ if __name__ == "__main__":
         if not methods:
             # auto-discover methods by listing directories in root
             try:
-                methods = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+                discovered = []
+                skipped = []
+                for d in os.listdir(root):
+                    if d.startswith('.'):
+                        continue
+                    full = os.path.join(root, d)
+                    if not os.path.isdir(full):
+                        continue
+
+                    if os.path.commonpath([os.path.abspath(full), output_abs]) == output_abs:
+                        skipped.append(d)
+                        continue
+
+                    discovered.append(d)
+                methods = discovered
+                if skipped:
+                    try:
+                        log.debug(f"Skipped output folder(s) while auto-discovering methods: {skipped}")
+                    except Exception:
+                        pass
             except Exception:
                 methods = []
         try:
@@ -1944,7 +1995,8 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-        input_folder = discover_local_inputs(root, methods, group=group, dataset=dataset, pair=pair, structure=args.structure)
+        input_folder = discover_local_inputs(root, methods, group=group, dataset=dataset, pair=pair,
+                                             structure=args.structure)
         if not input_folder:
             raise ValueError(
                 "No valid method inputs found. Checked layouts: "
@@ -1963,7 +2015,7 @@ if __name__ == "__main__":
                 log.error(f"Folder not exist: {name} -> {source}")
                 raise ValueError(f"Folder not exist: {name} -> {source}")
             # ensure there are image files
-            imgs = glob_single_files(source, IMG_EXTS)
+            imgs = filter_hidden(glob_single_files(source, IMG_EXTS))
             if len(imgs) == 0:
                 log.error(f"Folder {source} has no images (png/jpg/jpeg)")
                 raise ValueError(f"Folder {source} has no images (png/jpg/jpeg)")
