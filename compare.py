@@ -1905,7 +1905,7 @@ if __name__ == "__main__":
     group = args.group
     dataset = args.dataset
 
-    file_path = "./timeline_methods.txt"
+    file_path = "./methods.txt"
     methods = []
     if os.path.exists(file_path):
         with open(file_path, "r", encoding="utf-8") as f:
@@ -1914,7 +1914,7 @@ if __name__ == "__main__":
     input_folder = {}
     if args.source == 'external':
         if not methods:
-            raise ValueError("timeline_methods.txt is required for external source")
+            raise ValueError("methods.txt is required for external source")
         input_folder = {m: f"/data/user/results/{m}/{dataset}/pred/{pair}" for m in methods}
 
         # Optional GT/input reference if available

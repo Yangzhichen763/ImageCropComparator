@@ -125,7 +125,7 @@ def _list_methods_from_root(root: str) -> List[str]:
     return sorted(names)
 
 
-def _load_methods_from_timeline(path: str = "./timeline_methods.txt") -> List[str]:
+def _load_methods_from_file(path: str = "./methods.txt") -> List[str]:
     if not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8") as f:
@@ -140,10 +140,10 @@ def _build_input_folder(
     pair: str,
     structure: str,
 ) -> Dict[str, Any]:
-    methods = _load_methods_from_timeline("./timeline_methods.txt")
+    methods = _load_methods_from_file("./methods.txt")
     if source == "external":
         if not methods:
-            raise ValueError("timeline_methods.txt is required for external source")
+            raise ValueError("methods.txt is required for external source")
         input_folder = {m: f"/data/user/results/{m}/{dataset}/pred/{pair}" for m in methods}
         return input_folder
 
@@ -1051,7 +1051,7 @@ def build_demo() -> gr.Blocks:
                         choices=["local", "external"],
                         value="local",
                         label="Source",
-                        info="local: load from workspace root; external: expects /data/user/... and requires timeline_methods.txt",
+                        info="local: load from workspace root; external: expects /data/user/... and requires methods.txt",
                     )
                     root = _mk(
                         gr.Textbox,
@@ -1160,7 +1160,7 @@ def build_demo() -> gr.Blocks:
                             add_btn = _mk(gr.Button, value="Add ROI", variant="secondary", info="Add a new ROI entry (then click on the reference image).", elem_classes=["cc-fullwidth"])
                             clear_btn = _mk(gr.Button, value="Clear ROIs", variant="secondary", info="Remove all ROIs.", elem_classes=["cc-fullwidth"])
 
-                gr.Markdown("<div class='roi-click-hint' style='text-align: center;'>Click twice on the image to set ROIs.</div>")
+                gr.Markdown("<div class='roi-click-hint' style='text-align: center;'>Quick Tour: ① Click two points (A then B) on the image to set ROI corners. ② Click `Add ROI` to create a new ROI. ③ Click `Set ROI` then click the image to redefine ROI size/location. ④ Click `Move ROI` then click the image to move the ROI.</div>")
 
         # Keep ROI table as a hidden component (used for syncing state in callbacks).
         df_kwargs: Dict[str, Any] = dict(

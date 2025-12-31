@@ -23,17 +23,17 @@ Image Crop Comparator (ICC): A research-oriented, interactive image crop compara
 
 ### Features ✨
 - ROI-based multi-image previewer for image restoration (or other else) tasks
-- Fast and flexible multi-ROI selection via keyboard and mouse, with undo/redo support
+- Fast and flexible multi-ROI selection via keyboard- and mouse-shortcut, with undo/redo support
 - Automatic layout arrangement (left / right / top / bottom)
 - Support for multiple workspace structures
-- Highly customizable CLI for future research, and a user-friendly Web interface (gradio) for improved usability
+- Highly customizable CLI for future research, and a user-friendly Web interface (gradio) for improved experience
 
 ### News 🆕 
 
 - **2025.12.30** A quick demo of our tool is available on [Hugging Face](https://huggingface.co/spaces/OrangeC4709/ImageCropComparator). 🤗
 - **2025.12.30** Update Web version, a Gradio-based UI, providing better user experience for broader users. 🚀
 - **2025.12.29** Update [basic tutorial](#workflows). 🧾
-- **2025.12.28** Update ICC-CLI original-version, a runnable command-line (CLI) tool, including local/external sources, ROI selection, layout preview, and export. The compatible. 🎈
+- **2025.12.28** Update ICC-CLI original-version, a runnable command-line (CLI) tool, including local/external sources, ROI selection, layout preview, and export. 🎈
 
 ## Contents 📑 
 - Getting Started 🚀
@@ -303,21 +303,21 @@ Optional mouse-only quick tour (all operations by mouse):
 <details open>
 <summary>Keyboard</summary>
 
-|      Key      | Action                                                          |
-|:-------------:|-----------------------------------------------------------------|
-|      `a`      | Add smallest unused ROI                                         |
-|     `1–9`     | Add / select ROI by id; Tapping active id enters selection mode |
-|  `Shift+1–9`  | Duplicate active ROI to target id or copy its size              |
-|      `d`      | Add ROI with active size                                        |
-|   `← ↑ → ↓`   | Change layout direction                                         |
-|    `z / y`    | Undo / redo                                                     |
-|    `Enter`    | Switch dataset (`group/dataset` or `dataset`)                   |
-|    `Space`    | Jump to image by name                                           |
-|    `n / p`    | Next / previous image                                           |
-|      `s`      | Save outputs                                                    |
-|      `i`      | Toggle idle (hide/show grids)                                   |
-|      `r`      | Clear all ROIs                                                  |
-|   `q / Esc`   | Quit                                                            |
+|      Key      | Action                                                |
+|:-------------:|-------------------------------------------------------|
+|      `a`      | Add new ROI                                           |
+|     `1–9`     | Add / select ROI by id; Tapping active id to reselect |
+|  `Shift+1–9`  | Duplicate active ROI to target id or copy its size    |
+|      `d`      | Add ROI with active size                              |
+|   `← ↑ → ↓`   | Change layout direction                               |
+|    `z / y`    | Undo / redo                                           |
+|    `Enter`    | Switch dataset (`group/dataset` or `dataset`)         |
+|    `Space`    | Jump to image by name                                 |
+|    `n / p`    | Next / previous image                                 |
+|      `s`      | Save outputs                                          |
+|      `i`      | Toggle idle (hide/show grids)                         |
+|      `r`      | Clear all ROIs                                        |
+|   `q / Esc`   | Quit                                                  |
 
 > Note: Arrow keys (`← ↑ → ↓`) control the layout direction, not ROI movement. 
 > ROI movement is performed by mouse dragging in position mode.
@@ -351,7 +351,7 @@ python compare.py --source local --root <root> --group <group> --dataset <datase
 <details>
 <summary>External datasets</summary>
 
-External (video-form) datasets require `timeline_methods.txt`:
+External (video-form) datasets require `methods.txt`:
 
 ```bash
 python compare.py --source external --dataset SDSD-indoor --pair pair13 --layout left
