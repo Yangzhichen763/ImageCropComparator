@@ -1877,7 +1877,7 @@ if __name__ == "__main__":
                         help='Image key to show in Final Layout preview (default: reference key). Keys come from method names or GT/input if present.')
     parser.add_argument('--mode', '-m', default='selection', type=str, choices=['selection', 'position', 'idle'],
                         help='Startup interaction mode: selection (draw), position (move), or idle (hide grids).')
-    parser.add_argument('--output', '-o', default='./.crop_grid/', type=str,
+    parser.add_argument('--output', '-o', default='./crop_grids/', type=str,
                         help='Root output folder. Files are saved under output/<timestamp>/<dataset>/...')
     parser.add_argument('--thickness', '-t', default=2, type=int,
                         help='Line thickness for ROI boxes and crop borders (default: 2; minimum: 1).')

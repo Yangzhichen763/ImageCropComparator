@@ -384,7 +384,7 @@ def ui_load(
     # Instantiate comparator (no OpenCV windows used in Gradio mode)
     cmp_ = compare.InteractiveCropComparator(
         input_folder,
-        output_folder=output_dir or "./.crop_grid/",
+        output_folder=output_dir or "./crop_grids/",
         reference_key=('GT' if 'GT' in input_folder else ('input' if 'input' in input_folder else next(iter(input_folder.keys())))),
         columns=columns,
         grid_gap=grid_gap,
@@ -1217,7 +1217,7 @@ def build_demo() -> gr.Blocks:
             with gr.Row():
                 output_dir = _mk(
                     gr.Textbox,
-                    value="./.crop_grid/",
+                    value="./crop_grids/",
                     label="Output Dir",
                     info="Export root directory. Save Outputs writes results under this folder.",
                 )
