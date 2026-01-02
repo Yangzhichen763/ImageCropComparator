@@ -4,7 +4,7 @@
 
 # ✨ Image Crop Comparator 
 
-Image Crop Comparator (ICC): A research-oriented, interactive image crop comparator for pixel-level method analysis, designed for a fast and flexible interactive workflow with multi-ROI selection, automatic layout arrangement, and rich customization options.
+Image Crop Comparator (ICC): A research-oriented, interactive image crop comparator for pixel-level method analysis, designed for a fast and flexible interactive workflow with multi-ROI selection, auto layout, undo/redo, side-by-side ROI comparison, and more advanced options. 
 
 <div align="center">
 
@@ -22,8 +22,8 @@ Image Crop Comparator (ICC): A research-oriented, interactive image crop compara
 ## Overview 📌
 
 ### Features ✨
-- ROI-based multi-image previewer for image restoration (or other else) tasks
-- Fast and flexible multi-ROI selection via keyboard- and mouse-shortcut, with undo/redo support
+- ROI-based multi-image comparison viewer for image restoration and more
+- Fast and flexible multi-ROI selection via keyboard and mouse shortcut, with undo/redo support
 - Automatic layout arrangement (left / right / top / bottom)
 - Support for multiple workspace structures
 - Highly customizable CLI for future research, and a user-friendly Web interface (gradio) for improved experience
@@ -92,7 +92,10 @@ pip install -r requirements.txt
 ```bash
 python compare.py
 ```
-- Local mode (default) expects the example datasets under `examples/`; adjust `Root`/`Structure` in the UI if using your own layout.
+- Minimal two-step flow for local reviews:
+  1) Copy your method results into `examples/` (or another root that matches the structures below).
+  2) Run `python compare.py` and start selecting ROIs; defaults work out of the box.
+- If your layout differs, set `Root`/`Structure` in the UI or CLI to point to your folders.
 
 <a id="quick-start-gradio"></a>
 ### Quick Start (Gradio) 🚀
@@ -100,7 +103,7 @@ python compare.py
 python gradio_app.py
 ```
 - Runs the Gradio UI locally on http://127.0.0.1:7860/ by default.
-- Local mode (default) expects the example datasets under `examples/`; adjust `Root`/`Structure` in the UI if using your own layout.
+- Same two-step flow: drop images into your root (default: `examples/`), launch, and compare. Set `Root`/`Structure` if you use a custom layout.
 
 <a id="workspace-layout"></a>
 ### Workspace Layout 🗂️
