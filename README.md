@@ -12,6 +12,12 @@ Image Crop Comparator (ICC): A research-oriented, interactive image crop compara
 
 </div>
 
+<div align="center">
+
+🌐 **Languages**: 👉 English | [简体中文](README.zh-CN.md)
+
+</div>
+
 <details>
 <summary>Image Crop Comparator Demo</summary>
 
