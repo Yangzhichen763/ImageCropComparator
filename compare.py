@@ -1878,57 +1878,115 @@ class InteractiveCropComparator:
     cv2.destroyAllWindows()
 
 
+def _parse_exclude_methods(raw):
+    if not raw:
+        return set()
+    return {p.strip() for p in str(raw).replace(',', ' ').split() if p.strip()}
+
+
+def _apply_exclude(methods, exclude_set):
+    if not exclude_set:
+        return methods, []
+    removed = [m for m in methods if m in exclude_set]
+    kept = [m for m in methods if m not in exclude_set]
+    return kept, removed
+
+
 if __name__ == "__main__":
     log.banner("LLIE Results - Compare Tool")
 
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--source', choices=['local', 'external'], default='local', type=str,
+
+    # --- Data source & paths ---
+    g_data = parser.add_argument_group(
+        title='Data Source & Paths',
+        description='Select the data source (local/external) and related root/output paths.'
+    )
+    g_data.add_argument('--source', choices=['local', 'external'], default='local', type=str,
                         help='Data source: local uses the workspace structure under --root; external uses /data/user paths with --pair videos.')
-    parser.add_argument('--root', '-r', default='./examples', type=str,
+    g_data.add_argument('--root', '-r', default='./examples', type=str,
                         help='Workspace root containing method folders (local mode only). Example: /mnt/user/results/LLIE-results')
-    parser.add_argument('--group', '-g', default='SDSD-indoor+', type=str,
-                        help='Dataset group folder under each method (e.g., LOLv2-real+, SDSD-indoor+). Hyphens are auto-resolved across methods.')
-    parser.add_argument('--dataset', '-ds', default='SDSD-indoor', type=str,
-                        help='Leaf dataset folder under the group (e.g., DarkFace, DICM, LOL, SDSD-indoor).')
-    parser.add_argument('--pair', '-p', default='pair13', type=str,
-                        help='Video pair/sequence name (external mode only), e.g., pair13. Ignored in local mode.')
-    parser.add_argument('--columns', '-c', default=6, type=int,
-                        help='Number of columns in the per-ROI method grid view (rows are computed automatically).')
-    parser.add_argument('--grid-gap', default=2, type=int,
-                        help='Gap (in pixels) between tiles in per-ROI method grid windows (default: 2).')
-    parser.add_argument('--magnify', '--scale', default=2.0, type=float,
-                        help='Display-only magnification for crop grid windows. Final preview is not globally scaled; multi-ROI ignores this.')
-    parser.add_argument('--layout', default='right', type=str, choices=['left', 'top', 'right', 'bottom'],
-                        help='Final layout preview mode. Use arrow keys at runtime: ← left, ↑ top, → right, ↓ bottom..')
-    parser.add_argument('--preview', default=None, type=str,
-                        help='Image key to show in Final Layout preview (default: reference key). Keys come from method names or GT/input if present.')
-    parser.add_argument('--mode', '-m', default='selection', type=str, choices=['selection', 'position', 'idle'],
-                        help='Startup interaction mode: selection (draw), position (move), or idle (hide grids).')
-    parser.add_argument('--output', '-o', default='./crop_grids/', type=str,
+    g_data.add_argument('--output', '-o', default='./crop_grids/', type=str,
                         help='Root output folder. Files are saved under output/<timestamp>/<dataset>/...')
-    parser.add_argument('--thickness', '-t', default=2, type=int,
-                        help='Line thickness for ROI boxes and crop borders (default: 2; minimum: 1).')
-    parser.add_argument('--layout-border-scale', default=2.0, type=float,
-                        help='Thickness multiplier applied only to crop block borders in final layout (default: 2.0).')
-    parser.add_argument('--layout-gap', default=10, type=int,
-                        help='Gap (in pixels) between base image and crop block, and between crops themselves (default: 10).')
-    parser.add_argument('--layout-bg-color', default='transparent', type=str,
-                        help='Padding/background color as R,G,B[,A] for final layout gaps, or "transparent" (default). e.g., 0,0,0 or 255,255,255,255.')
-    parser.add_argument('--structure', default='auto',
-                        choices=['auto', 'group-dataset-pair', 'group-dataset', 'dataset-only', 'flat', 'shared'],
-                        help='Folder structure layout: auto (default), group-dataset-pair, group-dataset, dataset-only, flat (images directly under method), or shared (image-id folders containing per-method files such as img1/methodA.png).')
-    parser.add_argument('--roi-file', default=None, type=str,
-                        help='Optional ROI txt file to preload; format per line: id x1 y1 x2 y2.')
-    parser.add_argument('--compose-layout', dest='compose_layout', action='store_true', default=True,
-                        help='Enable side-by-side crop composition in the final layout (default: on).')
-    parser.add_argument('--no-compose-layout', dest='compose_layout', action='store_false',
-                        help='Disable composition; final layout shows only the reference image with ROI boxes.')
-    parser.add_argument('--no-color', action='store_true',
-                        help='Disable ANSI colored logs (use plain text).')
-    parser.add_argument('--log-level', default='info', choices=['debug', 'info', 'warn', 'error'],
-                        help='Logging level: debug|info|warn|error (default: info).')
+
+    # --- Dataset selection ---
+    g_dataset = parser.add_argument_group(
+        title='Dataset',
+        description='Specify dataset location (group/dataset) and the video sequence (pair) for external mode.'
+    )
+    g_dataset.add_argument('--group', '-g', default='SDSD-indoor+', type=str,
+                           help='Dataset group folder under each method (e.g., LOLv2-real+, SDSD-indoor+). Hyphens are auto-resolved across methods.')
+    g_dataset.add_argument('--dataset', '-ds', default='SDSD-indoor', type=str,
+                           help='Leaf dataset folder under the group (e.g., DarkFace, DICM, LOL, SDSD-indoor).')
+    g_dataset.add_argument('--pair', '-p', default='pair13', type=str,
+                           help='Video pair/sequence name (external mode only), e.g., pair13. Ignored in local mode.')
+
+    # --- Method discovery / filtering ---
+    g_methods = parser.add_argument_group(
+        title='Methods',
+        description='Control how methods are discovered/matched, and optionally exclude certain methods.'
+    )
+    g_methods.add_argument('--structure', default='auto',
+                           choices=['auto', 'group-dataset-pair', 'group-dataset', 'dataset-only', 'flat', 'shared'],
+                           help='Folder structure layout: auto (default), group-dataset-pair, group-dataset, dataset-only, flat (images directly under method), or shared (image-id folders containing per-method files such as img1/methodA.png).')
+    g_methods.add_argument('--exclude', '-x', default=None, type=str,
+                           help='Comma/space separated method names to exclude.')
+
+    # --- Interaction & grid visualization ---
+    g_view = parser.add_argument_group(
+        title='Interaction & Grid View',
+        description='Interaction mode and per-ROI grid visualization settings (columns, gap, magnification).'
+    )
+    g_view.add_argument('--mode', '-m', default='selection', type=str, choices=['selection', 'position', 'idle'],
+                        help='Startup interaction mode: selection (draw), position (move), or idle (hide grids).')
+    g_view.add_argument('--columns', '-c', default=6, type=int,
+                        help='Number of columns in the per-ROI method grid view (rows are computed automatically).')
+    g_view.add_argument('--grid-gap', default=2, type=int,
+                        help='Gap (in pixels) between tiles in per-ROI method grid windows (default: 2).')
+    g_view.add_argument('--magnify', '--scale', default=2.0, type=float,
+                        help='Display-only magnification for crop grid windows. Final preview is not globally scaled; multi-ROI ignores this.')
+
+    # --- Final layout preview ---
+    g_layout = parser.add_argument_group(
+        title='Final Layout Preview',
+        description='Final preview layout (switchable via arrow keys), preview image key, and composition/background/gap settings.'
+    )
+    g_layout.add_argument('--layout', default='right', type=str, choices=['left', 'top', 'right', 'bottom'],
+                          help='Final layout preview mode. Use arrow keys at runtime: ← left, ↑ top, → right, ↓ bottom..')
+    g_layout.add_argument('--preview', default=None, type=str,
+                          help='Image key to show in Final Layout preview (default: reference key). Keys come from method names or GT/input if present.')
+    g_layout.add_argument('--compose-layout', dest='compose_layout', action='store_true', default=True,
+                          help='Enable side-by-side crop composition in the final layout (default: on).')
+    g_layout.add_argument('--no-compose-layout', dest='compose_layout', action='store_false',
+                          help='Disable composition; final layout shows only the reference image with ROI boxes.')
+    g_layout.add_argument('--layout-border-scale', default=2.0, type=float,
+                          help='Thickness multiplier applied only to crop block borders in final layout (default: 2.0).')
+    g_layout.add_argument('--layout-gap', default=10, type=int,
+                          help='Gap (in pixels) between base image and crop block, and between crops themselves (default: 10).')
+    g_layout.add_argument('--layout-bg-color', default='transparent', type=str,
+                          help='Padding/background color as R,G,B[,A] for final layout gaps, or "transparent" (default). e.g., 0,0,0 or 255,255,255,255.')
+
+    # --- ROI / drawing ---
+    g_roi = parser.add_argument_group(
+        title='ROI',
+        description='ROI drawing thickness and an optional ROI preload file.'
+    )
+    g_roi.add_argument('--thickness', '-t', default=2, type=int,
+                       help='Line thickness for ROI boxes and crop borders (default: 2; minimum: 1).')
+    g_roi.add_argument('--roi-file', default=None, type=str,
+                       help='Optional ROI txt file to preload; format per line: id x1 y1 x2 y2.')
+
+    # --- Logging ---
+    g_log = parser.add_argument_group(
+        title='Logging',
+        description='Control log output (color on/off and verbosity level).'
+    )
+    g_log.add_argument('--no-color', action='store_true',
+                       help='Disable ANSI colored logs (use plain text).')
+    g_log.add_argument('--log-level', default='info', choices=['debug', 'info', 'warn', 'error'],
+                       help='Logging level: debug|info|warn|error (default: info).')
     args = parser.parse_args()
 
     output_abs = os.path.abspath(args.output)
@@ -1936,6 +1994,7 @@ if __name__ == "__main__":
     pair = args.pair
     group = args.group
     dataset = args.dataset
+    exclude_methods = _parse_exclude_methods(args.exclude)
 
     file_path = "./methods.txt"
     methods = []
@@ -1947,6 +2006,14 @@ if __name__ == "__main__":
     if args.source == 'external':
         if not methods:
             raise ValueError("methods.txt is required for external source")
+        methods, removed = _apply_exclude(methods, exclude_methods)
+        if removed:
+            try:
+                log.info(f"Excluded methods: {removed}")
+            except Exception:
+                pass
+        if not methods:
+            raise ValueError("No methods left after applying --exclude")
         input_folder = {m: f"/data/user/results/{m}/{dataset}/pred/{pair}" for m in methods}
 
         # Optional GT/input reference if available
@@ -1994,6 +2061,15 @@ if __name__ == "__main__":
             log.info(f"Visualizing methods: {methods}")
         except Exception:
             pass
+
+        methods, removed = _apply_exclude(methods, exclude_methods)
+        if removed:
+            try:
+                log.info(f"Excluded methods: {removed}")
+            except Exception:
+                pass
+        if not methods:
+            raise ValueError("No methods left after applying --exclude")
 
         input_folder = discover_local_inputs(root, methods, group=group, dataset=dataset, pair=pair,
                                              structure=args.structure)
