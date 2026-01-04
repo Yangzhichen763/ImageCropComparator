@@ -2,6 +2,7 @@ import os
 import inspect
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+import datetime
 
 import cv2
 import gradio as gr
@@ -132,6 +133,22 @@ def _load_methods_from_file(path: str = "./methods.txt") -> List[str]:
         return [line.strip() for line in f.read().splitlines() if line.strip()]
 
 
+def _parse_exclude_methods(raw: str) -> set:
+    """Parse comma/space separated method names to exclude."""
+    if not raw:
+        return set()
+    return {p.strip() for p in str(raw).replace(',', ' ').split() if p.strip()}
+
+
+def _apply_exclude(methods: List[str], exclude_set: set) -> Tuple[List[str], List[str]]:
+    """Filter methods by exclusion set. Returns (kept_methods, removed_methods)."""
+    if not exclude_set:
+        return methods, []
+    removed = [m for m in methods if m in exclude_set]
+    kept = [m for m in methods if m not in exclude_set]
+    return kept, removed
+
+
 def _build_input_folder(
     source: str,
     root: str,
@@ -139,16 +156,26 @@ def _build_input_folder(
     dataset: str,
     pair: str,
     structure: str,
+    exclude: str = "",
 ) -> Dict[str, Any]:
     methods = _load_methods_from_file("./methods.txt")
+    exclude_set = _parse_exclude_methods(exclude)
+    
     if source == "external":
         if not methods:
             raise ValueError("methods.txt is required for external source")
+        methods, removed = _apply_exclude(methods, exclude_set)
+        if not methods:
+            raise ValueError("No methods left after applying exclude filter")
         input_folder = {m: f"/data/user/results/{m}/{dataset}/pred/{pair}" for m in methods}
         return input_folder
 
     if not methods:
         methods = _list_methods_from_root(root)
+    
+    methods, removed = _apply_exclude(methods, exclude_set)
+    if not methods:
+        raise ValueError("No methods left after applying exclude filter")
 
     input_folder = compare.discover_local_inputs(root, methods, group=group, dataset=dataset, pair=pair, structure=structure)
     if not input_folder:
@@ -364,6 +391,7 @@ def ui_load(
     dataset: str,
     pair: str,
     structure: str,
+    exclude: str,
     roi_file: str,
     compose_layout: bool,
     output_dir: str,
@@ -375,8 +403,11 @@ def ui_load(
     layout_gap: int,
     layout_border_scale: float,
     layout_bg_color: str,
+    layout_use_alpha: bool,
+    grid_sort_mode: str,
+    grid_sort_reverse: bool,
 ) -> Tuple[Any, ...]:
-    input_folder = _build_input_folder(source, root, group, dataset, pair, structure)
+    input_folder = _build_input_folder(source, root, group, dataset, pair, structure, exclude)
 
     # Parse background color
     bg = _parse_bg_color(layout_bg_color)
@@ -393,13 +424,14 @@ def ui_load(
         layout_border_scale=layout_border_scale,
         layout_gap=layout_gap,
         layout_bg_color=bg,
+        layout_use_alpha=layout_use_alpha,
         compose_layout=compose_layout if compose_layout is not None else True,
         current_group=group,
         current_dataset=dataset,
     )
     cmp_.layout_mode = layout
-    cmp_.sort_mode = 'id'
-    cmp_.sort_reverse = False
+    cmp_.sort_mode = grid_sort_mode
+    cmp_.sort_reverse = grid_sort_reverse
     cmp_.mode = 'selection'
     if len(cmp_.rois) == 0:
         cmp_.add_roi(1)
@@ -435,6 +467,7 @@ def ui_load(
     # After a successful load: keep Load clickable but make it non-primary; enable Save as primary.
     load_btn_u = gr.Button(value="Load", interactive=True, variant="secondary")
     save_btn_u = gr.Button(value="Save Outputs", interactive=True, variant="primary")
+    save_grid_btn_u = gr.Button(value="Save Grid Images", interactive=True, variant="secondary")
 
     # ROI panel state
     set_btn_u = gr.Button(value="Set ROI", variant="primary" if cmp_.mode == "selection" else "secondary")
@@ -461,6 +494,7 @@ def ui_load(
         move_btn_u,
         active_roi_u,
         add_roi_id_u,
+        save_grid_btn_u,
     )
 
 
@@ -541,6 +575,8 @@ def ui_apply_grid_settings(
     columns: int,
     grid_gap: int,
     magnify: float,
+    grid_sort_mode: str,
+    grid_sort_reverse: bool,
 ) -> Tuple[Optional[np.ndarray], str]:
     if sess is None:
         return None, "Session not loaded yet. Click Load first."
@@ -557,6 +593,14 @@ def ui_apply_grid_settings(
     try:
         if hasattr(cmp_, "display_scale"):
             cmp_.display_scale = float(magnify)
+    except Exception:
+        pass
+    try:
+        cmp_.sort_mode = grid_sort_mode
+    except Exception:
+        pass
+    try:
+        cmp_.sort_reverse = bool(grid_sort_reverse)
     except Exception:
         pass
 
@@ -656,6 +700,9 @@ def ui_apply_settings(
     layout_gap: int,
     layout_border_scale: float,
     layout_bg_color: str,
+    layout_use_alpha: bool,
+    grid_sort_mode: str,
+    grid_sort_reverse: bool,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], List[List[int]], str]:
     if sess is None:
         return None, None, None, [], "Session not loaded yet. Click Load first."
@@ -697,6 +744,18 @@ def ui_apply_settings(
         pass
     try:
         cmp_.layout_bg_color = _parse_bg_color(layout_bg_color)
+    except Exception:
+        pass
+    try:
+        cmp_.layout_use_alpha = bool(layout_use_alpha)
+    except Exception:
+        pass
+    try:
+        cmp_.sort_mode = grid_sort_mode
+    except Exception:
+        pass
+    try:
+        cmp_.sort_reverse = bool(grid_sort_reverse)
     except Exception:
         pass
 
@@ -955,8 +1014,46 @@ def ui_save(sess: _Session, save_label: str) -> str:
         return "Session not loaded yet. Click Load first."
     label = save_label.strip() if isinstance(save_label, str) and save_label.strip() else (sess.pair if sess.source == 'external' else sess.dataset)
     sess.comparator.save(label, sess.dataset)
-    out_dir = os.path.join(sess.comparator.output_folder, sess.comparator.save_session_ts or "")
+    out_dir = os.path.join(sess.comparator.output_folder.replace('/', '\\'), sess.comparator.save_session_ts or "")
     return f"Saved. Output root: {out_dir}"
+
+
+def ui_save_grid(sess: _Session, save_label: str) -> str:
+    """Save per-ROI method grid images."""
+    if sess is None:
+        return "Session not loaded yet. Click Load first."
+    
+    cmp_ = sess.comparator
+    if len(cmp_.rois) == 0 or all(r.get('rect') is None for r in cmp_.rois.values()):
+        return "No valid ROIs to save grid."
+    
+    label = save_label.strip() if isinstance(save_label, str) and save_label.strip() else (sess.pair if sess.source == 'external' else sess.dataset)
+    
+    try:
+        # Create output directory with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_root = os.path.join(cmp_.output_folder.replace('/', '\\'), timestamp, sess.dataset or label)
+        os.makedirs(out_root, exist_ok=True)
+        
+        # Save grid for each ROI
+        valid_rois = [(rid, r) for rid, r in sorted(cmp_.rois.items()) if r['rect'] is not None]
+        for roi_idx, (rid, roi_info) in enumerate(valid_rois):
+            grid = cmp_.build_grid_for_rect(roi_info['rect'], roi_color=roi_info.get('color'))
+            if grid is not None:
+                # Determine file extension based on grid channels
+                is_rgba = grid.shape[2] == 4 if grid.ndim == 3 else False
+                grid_path = os.path.join(out_root, f"grid_roi{rid}.png")
+                
+                # For RGBA, convert to BGRA for cv2.imwrite
+                if is_rgba:
+                    grid_bgra = cv2.cvtColor(grid, cv2.COLOR_RGBA2BGRA)
+                    cv2.imwrite(grid_path, grid_bgra)
+                else:
+                    cv2.imwrite(grid_path, grid)
+        
+        return f"Grid images saved to: {out_root}"
+    except Exception as e:
+        return f"Error saving grid: {str(e)}"
 
 
 def build_demo() -> gr.Blocks:
@@ -1088,9 +1185,15 @@ def build_demo() -> gr.Blocks:
                     )
 
                 with gr.Row():
+                    exclude = _mk(
+                        gr.Textbox,
+                        value=" ",
+                        label="Exclude Methods",
+                        info="Comma/space separated method names to exclude (e.g., 'method1, method2').",
+                    )
                     roi_file = _mk(
                         gr.Textbox,
-                        value="",
+                        value=" ",
                         label="ROI File (optional)",
                         info="Path to ROI txt (id x1 y1 x2 y2). Loaded on Load.",
                     )
@@ -1195,9 +1298,14 @@ def build_demo() -> gr.Blocks:
                 with gr.Group():
                     with gr.Accordion("🧩 Per-ROI Method Grid Settings", open=False):
                         with gr.Row():
-                            columns = _mk(gr.Slider, minimum=1, maximum=12, value=6, step=1, label="Columns", info="Number of columns in the per-ROI method grid.")
+                            columns = _mk(gr.Slider, minimum=1, maximum=12, value=4, step=1, label="Columns", info="Number of columns (None=auto when methods≥9).")
                             grid_gap = _mk(gr.Slider, minimum=0, maximum=20, value=2, step=1, label="Grid Gap", info="Pixel gap between tiles in the method grid.")
                             magnify = _mk(gr.Slider, minimum=0.25, maximum=8.0, value=2.0, step=0.25, label="Magnify", info="Scale the Per-ROI Method Grid display (Gradio-only).")
+                        with gr.Row():
+                            grid_sort_mode = _mk(gr.Dropdown, choices=["id", "name"], value="id", label="Sort By", info="Sort methods by ID or name in grid.")
+                            grid_sort_reverse = _mk(gr.Checkbox, value=False, label="Reverse Sort", info="Reverse the sort order.")
+                        with gr.Row():
+                            layout_use_alpha = _mk(gr.Checkbox, value=False, label="Transparent BG", info="Use transparent (RGBA) background for grid.") 
 
                     with gr.Accordion("🖼️ Reference + ROIs Settings", open=False):
                         thickness = _mk(gr.Slider, minimum=1, maximum=12, value=2, step=1, label="ROI Thickness", info="Thickness of ROI rectangles in the reference preview.")
@@ -1228,13 +1336,20 @@ def build_demo() -> gr.Blocks:
                     info="Override save label (defaults to dataset in local mode, pair in external mode).",
                 )
             with gr.Row():
-                # Full-width action button
+                # Full-width action buttons
                 save_btn = _mk(
                     gr.Button,
                     value="Save Outputs",
                     variant="secondary",
                     interactive=False,
                     info="Write orig/final/crops to Output Dir.",
+                )
+                save_grid_btn = _mk(
+                    gr.Button,
+                    value="Save Grid Images",
+                    variant="secondary",
+                    interactive=False,
+                    info="Save per-ROI grid images.",
                 )
             save_status = gr.Markdown("")
 
@@ -1248,6 +1363,7 @@ def build_demo() -> gr.Blocks:
                 dataset,
                 pair,
                 structure,
+                exclude,
                 roi_file,
                 compose_layout,
                 output_dir,
@@ -1259,6 +1375,9 @@ def build_demo() -> gr.Blocks:
                 layout_gap,
                 layout_border_scale,
                 layout_bg_color,
+                layout_use_alpha,
+                grid_sort_mode,
+                grid_sort_reverse,
             ],
             outputs=[
                 sess_state,
@@ -1280,6 +1399,7 @@ def build_demo() -> gr.Blocks:
                 move_roi_btn,
                 active_roi_id,
                 add_roi_id,
+                save_grid_btn,
             ],
         )
 
@@ -1304,20 +1424,36 @@ def build_demo() -> gr.Blocks:
         # - Grid settings: update grid only
         columns.release(
             fn=ui_apply_grid_settings,
-            inputs=[sess_state, columns, grid_gap, magnify],
+            inputs=[sess_state, columns, grid_gap, magnify, grid_sort_mode, grid_sort_reverse],
             outputs=[grid_img, status],
         )
         grid_gap.release(
             fn=ui_apply_grid_settings,
-            inputs=[sess_state, columns, grid_gap, magnify],
+            inputs=[sess_state, columns, grid_gap, magnify, grid_sort_mode, grid_sort_reverse],
             outputs=[grid_img, status],
         )
         magnify.release(
             fn=ui_apply_grid_settings,
-            inputs=[sess_state, columns, grid_gap, magnify],
+            inputs=[sess_state, columns, grid_gap, magnify, grid_sort_mode, grid_sort_reverse],
+            outputs=[grid_img, status],
+        )
+        grid_sort_mode.change(
+            fn=ui_apply_grid_settings,
+            inputs=[sess_state, columns, grid_gap, magnify, grid_sort_mode, grid_sort_reverse],
+            outputs=[grid_img, status],
+        )
+        grid_sort_reverse.change(
+            fn=ui_apply_grid_settings,
+            inputs=[sess_state, columns, grid_gap, magnify, grid_sort_mode, grid_sort_reverse],
+            outputs=[grid_img, status],
+        )
+        layout_use_alpha.change(
+            fn=ui_apply_grid_settings,
+            inputs=[sess_state, columns, grid_gap, magnify, grid_sort_mode, grid_sort_reverse],
             outputs=[grid_img, status],
         )
 
+        # - Final layout settings: update final preview only
         # - Final layout settings: update final preview only
         layout.change(
             fn=ui_apply_final_settings,
@@ -1407,6 +1543,12 @@ def build_demo() -> gr.Blocks:
 
         save_btn.click(
             fn=ui_save,
+            inputs=[sess_state, save_label],
+            outputs=[save_status],
+        )
+
+        save_grid_btn.click(
+            fn=ui_save_grid,
             inputs=[sess_state, save_label],
             outputs=[save_status],
         )
