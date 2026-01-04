@@ -315,7 +315,7 @@ class InteractiveCropComparator:
             input_folders,
             output_folder,
             reference_key=None,
-            columns=6,
+            columns=None,
             grid_gap=2,
             display_scale=1.0,
             line_thickness=5,
@@ -323,6 +323,7 @@ class InteractiveCropComparator:
             layout_gap=10,
             layout_bg_color: Union[str, Tuple] = 'transparent',
             layout_min_scale=1.0,
+            layout_use_alpha: bool = False,
             compose_layout: bool = True,
             current_group=None,
             current_dataset=None,
@@ -330,6 +331,13 @@ class InteractiveCropComparator:
     ):
         self.input_folders = input_folders
         self.output_folder = output_folder
+        # Auto-compute columns if not specified and method count >= 9
+        if columns is None:
+            num_methods = len(input_folders) if input_folders else 0
+            if num_methods >= 9:
+                columns = (num_methods + 1) // 2
+            else:
+                columns = num_methods
         self.columns = max(int(columns), 1)
         self.grid_gap = int(grid_gap)
         try:
@@ -414,7 +422,7 @@ class InteractiveCropComparator:
             self.layout_min_scale = max(0.01, float(layout_min_scale))
         except Exception:
             self.layout_min_scale = 1.0
-        self.layout_use_alpha = False
+        self.layout_use_alpha = bool(layout_use_alpha)
         try:
             if isinstance(layout_bg_color, str):
                 lb = layout_bg_color.strip().lower()
@@ -468,6 +476,9 @@ class InteractiveCropComparator:
         # dataset/group tracking
         self.group = current_group
         self.dataset = current_dataset
+        # Grid display ordering / optional .srt-based sorting
+        self._method_srt_stems = {}
+        self._all_methods_have_srt = False
         # Derive group/dataset if not provided
         if self.group is None or self.dataset is None:
             try:
@@ -480,6 +491,8 @@ class InteractiveCropComparator:
                     self.group = parts[-3] if len(parts) >= 3 and self.group is None else self.group
             except Exception:
                 pass
+
+        self._refresh_method_grid_sorting()
 
     def _infer_method_root(self, src, files):
         """Best-effort method root inference for rebuild_dataset support."""
@@ -836,8 +849,135 @@ class InteractiveCropComparator:
         self.mode = 'selection'
         self.grid_windows = set()
         self.add_roi()
+        self._refresh_method_grid_sorting()
         log.success(f"Switched to {log.style_path(new_group)}/{log.style_path(new_dataset)}")
         return True
+
+    # ---- Grid ordering helpers ----
+    @staticmethod
+    def _is_input_key(key):
+        try:
+            return str(key).lower() == 'input'
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_gt_key(key):
+        try:
+            return str(key).lower() == 'gt'
+        except Exception:
+            return False
+
+    def _refresh_method_grid_sorting(self):
+        """If every method folder contains a .srt file, use its stem for grid sorting."""
+        self._method_srt_stems = {}
+
+        keys = list(self.input_folders.keys()) if isinstance(self.input_folders, dict) else []
+        methods = [k for k in keys if (not self._is_input_key(k)) and (not self._is_gt_key(k))]
+        if not methods:
+            self._all_methods_have_srt = False
+            return
+
+        def _list_srt_files(folder):
+            try:
+                files = [
+                    f for f in os.listdir(folder)
+                    if (not f.startswith('.')) and f.lower().endswith('.srt') and os.path.isfile(os.path.join(folder, f))
+                ]
+                return _natsorted(files)
+            except Exception:
+                return []
+
+        def _method_dir_from_src(method_key, src_path):
+            if not isinstance(src_path, str) or not src_path:
+                return None
+            try:
+                norm = os.path.normpath(src_path)
+                parts = norm.split(os.sep)
+                # Prefer the directory segment that exactly matches the method name.
+                idx = None
+                for i in range(len(parts) - 1, -1, -1):
+                    if parts[i] == method_key:
+                        idx = i
+                        break
+                if idx is not None:
+                    cand = os.sep.join(parts[:idx + 1])
+                    if os.path.isdir(cand):
+                        return cand
+            except Exception:
+                return None
+            return None
+
+        all_have = True
+        for k in methods:
+            # The .srt is expected under .../<method>/ (not the dataset leaf folder)
+            method_dir = None
+
+            # 1) Try recorded method root
+            try:
+                mr = (self.method_roots or {}).get(k)
+                if isinstance(mr, str) and os.path.isdir(mr):
+                    method_dir = mr
+            except Exception:
+                method_dir = None
+
+            # 2) Try deriving from the input folder path
+            if method_dir is None:
+                src = self.input_folders.get(k)
+                method_dir = _method_dir_from_src(k, src)
+
+            # 3) Fallback: walk up from src to find a directory containing .srt
+            if method_dir is None:
+                src = self.input_folders.get(k)
+                if isinstance(src, str) and os.path.isdir(src):
+                    cur = os.path.normpath(src)
+                    for _ in range(6):
+                        if os.path.isdir(cur) and _list_srt_files(cur):
+                            method_dir = cur
+                            break
+                        parent = os.path.dirname(cur)
+                        if not parent or parent == cur:
+                            break
+                        cur = parent
+
+            if method_dir is None or (not os.path.isdir(method_dir)):
+                all_have = False
+                break
+
+            srt_files = _list_srt_files(method_dir)
+            if not srt_files:
+                all_have = False
+                break
+
+            stem = os.path.splitext(srt_files[0])[0]
+            self._method_srt_stems[k] = stem
+
+        if all_have:
+            log.info(f"Using .srt-based sorting for grid display of methods: "
+                     f"{', '.join(f'{log.style_path(k)}->{v}' for k, v in self._method_srt_stems.items())}")
+        else:
+            missing = [k for k in methods if k not in self._method_srt_stems]
+            log.info(f"Not all methods have .srt files. Methods missing .srt files: {', '.join(log.style_path(k) for k in missing)}")
+        self._all_methods_have_srt = bool(all_have and len(self._method_srt_stems) == len(methods))
+
+    def _ordered_method_keys_for_grid(self):
+        """Order keys for grid tiles: Input first, GT last, optional .srt stem sorting."""
+        keys = list(self.image_files.keys())
+        if not keys:
+            return []
+
+        input_keys = [k for k in keys if self._is_input_key(k)]
+        gt_keys = [k for k in keys if self._is_gt_key(k)]
+        middle = [k for k in keys if (k not in input_keys) and (k not in gt_keys)]
+
+        if self._all_methods_have_srt and middle:
+            try:
+                if all(k in self._method_srt_stems for k in middle):
+                    middle = sorted(middle, key=lambda k: (self._method_srt_stems.get(k, ''), str(k)))
+            except Exception:
+                pass
+
+        return input_keys + middle + gt_keys
 
     def jump_to_image_by_name(self, name):
         # Match by stem or filename
@@ -1157,13 +1297,13 @@ class InteractiveCropComparator:
         img = cv2.imread(files[idx])
         return img
 
-    def build_grid_for_rect(self, rect, header_text=None):
+    def build_grid_for_rect(self, rect, roi_color=None):
         x1, y1, x2, y2 = self.clamp_rect(rect)
         roi_w = max(1, x2 - x1)
         roi_h = max(1, y2 - y1)
 
         # method_keys = [k for k in self.image_files.keys() if k not in ['GT', 'input']]
-        method_keys = [k for k in self.image_files.keys()]
+        method_keys = self._ordered_method_keys_for_grid()
         if len(method_keys) == 0:
             method_keys = list(self.image_files.keys())
 
@@ -1172,7 +1312,24 @@ class InteractiveCropComparator:
         gap = self.grid_gap
         grid_h = rows * roi_h + gap * (rows - 1)
         grid_w = cols * roi_w + gap * (cols - 1)
-        grid = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
+        
+        # Use layout_bg_color for grid background, support RGBA if transparent
+        if self.layout_use_alpha:
+            bg_color = self.layout_bg_color if len(self.layout_bg_color) >= 4 else (self.layout_bg_color[0] if len(self.layout_bg_color) >= 1 else 0, self.layout_bg_color[1] if len(self.layout_bg_color) >= 2 else 0, self.layout_bg_color[2] if len(self.layout_bg_color) >= 3 else 0, 0)
+            grid_rgb = np.full((grid_h, grid_w, 3), bg_color[:3], dtype=np.uint8)
+            grid_alpha = np.full((grid_h, grid_w), bg_color[3] if len(bg_color) >= 4 else 0, dtype=np.uint8)
+        else:
+            bg_color = self.layout_bg_color[:3] if len(self.layout_bg_color) >= 3 else (0, 0, 0)
+            grid_rgb = np.full((grid_h, grid_w, 3), bg_color, dtype=np.uint8)
+            grid_alpha = None
+
+        # Use ROI color for labels (match the ROI selection box color)
+        label_color = (0, 255, 0)
+        try:
+            if roi_color is not None:
+                label_color = tuple(int(v) for v in roi_color[:3])
+        except Exception:
+            label_color = (0, 255, 0)
 
         for i, name in enumerate(method_keys):
             img = self.read_frame(name, self.current_frame)
@@ -1184,12 +1341,34 @@ class InteractiveCropComparator:
             rx2 = max(rx1 + 1, min(w, x2))
             ry2 = max(ry1 + 1, min(h, y2))
             crop = img[ry1:ry2, rx1:rx2]
-            if crop.shape[0] != roi_h or crop.shape[1] != roi_w:
-                pad = np.zeros((roi_h, roi_w, 3), dtype=np.uint8)
-                ph = min(roi_h, crop.shape[0])
-                pw = min(roi_w, crop.shape[1])
-                pad[:ph, :pw] = crop[:ph, :pw]
-                crop = pad
+            
+            # Extract RGB and alpha channels from crop if needed
+            crop_rgb = crop[:, :, :3] if crop.ndim == 3 and crop.shape[2] >= 3 else crop if crop.ndim == 2 else crop
+            crop_alpha = crop[:, :, 3] if crop.ndim == 3 and crop.shape[2] == 4 else np.full((crop.shape[0], crop.shape[1]), 255, dtype=np.uint8)
+            
+            # Handle size mismatch
+            if crop_rgb.shape[0] != roi_h or crop_rgb.shape[1] != roi_w:
+                if self.layout_use_alpha:
+                    # Pad RGB part
+                    pad_rgb = np.full((roi_h, roi_w, 3), bg_color[:3], dtype=np.uint8)
+                    ph = min(roi_h, crop_rgb.shape[0])
+                    pw = min(roi_w, crop_rgb.shape[1])
+                    if crop_rgb.ndim == 3:
+                        pad_rgb[:ph, :pw] = crop_rgb[:ph, :pw]
+                    crop_rgb = pad_rgb
+                    
+                    # Pad alpha part
+                    pad_alpha = np.full((roi_h, roi_w), bg_color[3] if len(bg_color) >= 4 else 0, dtype=np.uint8)
+                    pad_alpha[:ph, :pw] = crop_alpha[:ph, :pw]
+                    crop_alpha = pad_alpha
+                else:
+                    # Pad RGB part
+                    pad_rgb = np.full((roi_h, roi_w, 3), bg_color, dtype=np.uint8)
+                    ph = min(roi_h, crop_rgb.shape[0])
+                    pw = min(roi_w, crop_rgb.shape[1])
+                    if crop_rgb.ndim == 3:
+                        pad_rgb[:ph, :pw] = crop_rgb[:ph, :pw]
+                    crop_rgb = pad_rgb
 
             row = i // cols
             col = i % cols
@@ -1197,13 +1376,23 @@ class InteractiveCropComparator:
             cg = col * gap
             y0 = row * roi_h + rg
             x0 = col * roi_w + cg
-            grid[y0:y0 + roi_h, x0:x0 + roi_w] = crop
-            cv2.putText(grid, name, (x0 + 2, y0 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1,
-                        lineType=cv2.LINE_AA)
-
-        if header_text:
-            cv2.putText(grid, header_text, (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1,
-                        lineType=cv2.LINE_AA)
+            
+            # Place RGB crop into grid
+            grid_rgb[y0:y0 + roi_h, x0:x0 + roi_w] = crop_rgb
+            
+            # Place alpha crop into alpha channel if exists
+            if self.layout_use_alpha and grid_alpha is not None:
+                grid_alpha[y0:y0 + roi_h, x0:x0 + roi_w] = crop_alpha
+            
+            # Draw text on RGB part
+            cv2.putText(grid_rgb, name, (x0 + 2, y0 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, label_color, 1, lineType=cv2.LINE_AA)
+        
+        # Combine RGB and alpha if needed
+        if self.layout_use_alpha and grid_alpha is not None:
+            grid = np.dstack([grid_rgb, grid_alpha])
+        else:
+            grid = grid_rgb
+        
         return grid
 
     def build_grid(self):
@@ -1215,17 +1404,36 @@ class InteractiveCropComparator:
         for rid, r in valid_rois:
             # header = f"ROI {rid}"
             # g = self.build_grid_for_rect(r['rect'], header_text=header)
-            g = self.build_grid_for_rect(r['rect'])
+            g = self.build_grid_for_rect(r['rect'], roi_color=r.get('color'))
             if g is not None:
                 grids.append(g)
         if len(grids) == 0:
             return None
+        
+        # Determine channel count from first grid
+        grid_channels = grids[0].shape[2] if grids[0].ndim == 3 else 3
+        
         total_h = sum(g.shape[0] for g in grids) + gap * (len(grids) - 1)
         total_w = max(g.shape[1] for g in grids)
-        out = np.zeros((total_h, total_w, 3), dtype=np.uint8)
+        
+        # Create output with same channel count as input grids
+        if grid_channels == 4:
+            out = np.zeros((total_h, total_w, 4), dtype=np.uint8)
+        else:
+            out = np.zeros((total_h, total_w, 3), dtype=np.uint8)
+        
         y = 0
         for i, g in enumerate(grids):
             h, w = g.shape[:2]
+            g_channels = g.shape[2] if g.ndim == 3 else 3
+            
+            # Ensure grid matches output channel count
+            if g_channels != grid_channels:
+                if grid_channels == 4 and g_channels == 3:
+                    g = np.dstack([g, np.full((g.shape[0], g.shape[1]), 255, dtype=np.uint8)])
+                elif grid_channels == 3 and g_channels == 4:
+                    g = g[:, :, :3]
+            
             out[y:y + h, :w] = g
             y += h
             if i < len(grids) - 1:
@@ -1618,7 +1826,7 @@ class InteractiveCropComparator:
             valid_rois = [(rid, r) for rid, r in sorted(self.rois.items()) if r['rect'] is not None]
             for rid, r in valid_rois:
                 name = f"{self.window_grid} ROI {rid}"
-                grid = self.build_grid_for_rect(r['rect'])  # , header_text=f"ROI {rid}")
+                grid = self.build_grid_for_rect(r['rect'], roi_color=r.get('color'))  # , header_text=f"ROI {rid}")
                 if grid is None:
                     continue
                 if self.display_scale and self.display_scale != 1.0:
@@ -1732,6 +1940,15 @@ class InteractiveCropComparator:
         base_dir = os.path.join(self.output_folder, self.save_session_ts, dataset)
         os.makedirs(base_dir, exist_ok=True)
 
+        # Use reference image stem as the per-frame output folder name
+        try:
+            ref_file_for_dir = self.image_files[self.reference_key][self.current_frame]
+            ref_stem_for_dir = os.path.basename(ref_file_for_dir).rsplit('.', 1)[0]
+            frame_dir = os.path.join(base_dir, ref_stem_for_dir)
+        except Exception:
+            frame_dir = base_dir
+        os.makedirs(frame_dir, exist_ok=True)
+
         # Determine method keys (exclude GT/input if present)
         # method_keys = [k for k in self.image_files.keys() if k not in ['GT', 'input']]
         method_keys = [k for k in self.image_files.keys()]
@@ -1776,8 +1993,49 @@ class InteractiveCropComparator:
                 if x2 <= x1 + 0 or y2 <= y1 + 0:
                     continue
                 crop = img[y1:y2, x1:x2]
+                
+                # Apply layout_bg_color background if crop size doesn't match ROI bounds
+                roi_w = x2 - x1
+                roi_h = y2 - y1
+                if crop.shape[0] != roi_h or crop.shape[1] != roi_w:
+                    if self.layout_use_alpha:
+                        bg_color = self.layout_bg_color if len(self.layout_bg_color) >= 4 else (self.layout_bg_color[0] if len(self.layout_bg_color) >= 1 else 0, self.layout_bg_color[1] if len(self.layout_bg_color) >= 2 else 0, self.layout_bg_color[2] if len(self.layout_bg_color) >= 3 else 0, 0)
+                        padded = np.full((roi_h, roi_w, 4), bg_color, dtype=np.uint8)
+                        if crop.ndim == 3 and crop.shape[2] == 3:
+                            crop_rgba = np.dstack([crop, np.full((crop.shape[0], crop.shape[1]), 255, dtype=np.uint8)])
+                        else:
+                            crop_rgba = crop if crop.ndim == 3 and crop.shape[2] >= 3 else np.dstack([crop, np.full((crop.shape[0], crop.shape[1]), 255, dtype=np.uint8)])
+                        ph = min(roi_h, crop_rgba.shape[0])
+                        pw = min(roi_w, crop_rgba.shape[1])
+                        padded[:ph, :pw] = crop_rgba[:ph, :pw]
+                        crop = padded
+                    else:
+                        bg_color = self.layout_bg_color[:3] if len(self.layout_bg_color) >= 3 else (0, 0, 0)
+                        padded = np.full((roi_h, roi_w, 3), bg_color, dtype=np.uint8)
+                        ph = min(roi_h, crop.shape[0])
+                        pw = min(roi_w, crop.shape[1])
+                        padded[:ph, :pw] = crop[:ph, :pw]
+                        crop = padded
+                
                 crop_out = os.path.join(m_dir, f"crop_roi{rid}_{m}.png")
                 cv2.imwrite(crop_out, crop)
+
+        # Save grid images (per-ROI and all-ROIs) once per frame
+        try:
+            valid_rois = [(rid, r) for rid, r in sorted(self.rois.items()) if r.get('rect') is not None]
+            for rid, r in valid_rois:
+                grid = self.build_grid_for_rect(r['rect'], roi_color=r.get('color'))
+                if grid is None:
+                    continue
+                grid_out = os.path.join(frame_dir, f"grid_roi{rid}.png")
+                cv2.imwrite(grid_out, grid)
+
+            grid_all = self.build_grid()
+            if grid_all is not None:
+                grid_all_out = os.path.join(frame_dir, "grid_all_rois.png")
+                cv2.imwrite(grid_all_out, grid_all)
+        except Exception as e:
+            log.warn(f"Failed to save grid images: {e}")
         try:
             ref_file = self.image_files[self.reference_key][self.current_frame]
             ref_stem = os.path.basename(ref_file).rsplit('.', 1)[0]
@@ -1941,8 +2199,8 @@ if __name__ == "__main__":
     )
     g_view.add_argument('--mode', '-m', default='selection', type=str, choices=['selection', 'position', 'idle'],
                         help='Startup interaction mode: selection (draw), position (move), or idle (hide grids).')
-    g_view.add_argument('--columns', '-c', default=6, type=int,
-                        help='Number of columns in the per-ROI method grid view (rows are computed automatically).')
+    g_view.add_argument('--columns', '-c', default=None, type=lambda x: int(x) if x else None,
+                        help='Number of columns in the per-ROI method grid view (rows are computed automatically). If not specified and there are >=9 methods, auto-computed as (num_methods+1)//2.')
     g_view.add_argument('--grid-gap', default=2, type=int,
                         help='Gap (in pixels) between tiles in per-ROI method grid windows (default: 2).')
     g_view.add_argument('--magnify', '--scale', default=2.0, type=float,

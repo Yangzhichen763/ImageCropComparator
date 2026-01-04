@@ -14,7 +14,7 @@
 
 <div align="center">
 
-🌐 **语言**： [English](README.md) | 简体中文
+🌐 **语言**： [English](README.md) | 👉 简体中文
 
 </div>
 
@@ -24,6 +24,15 @@
 ![Image Crop Comparator Demo](figures/gradio_page.png)
 
 </details>
+
+
+<details open>
+<summary>裁剪图像并排展示</summary>
+
+<p align="center"><img src="figures/crop_grids.png" width="100%" alt="图像裁剪"><br><span style="color: #888; font-size: 12px;">图 1. 对比多个方法的图像框选区域。交互式选择需要可视化的区域（ROI），ICC 会自动对齐并排显示所有方法的对应区域。</span></p>
+
+</details>
+
 
 ## 概览 📌
 
