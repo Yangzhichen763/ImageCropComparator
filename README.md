@@ -27,7 +27,7 @@ Image Crop Comparator (ICC): A research-oriented, interactive image crop compara
 
 
 <details open>
-<summary>Side-by-side Image Crops</summary>
+<summary>Side-by-side Image Crops Preview</summary>
 
 <p align="center"><img src="figures/crop_grids.png" width="100%" alt="Image Crops"><br><span style="color: #888; font-size: 12px;">Fig. 1. Compare image crops across multiple methods. Select regions of interest (ROIs) interactively, and ICC will automatically align and display the corresponding crops from all methods side by side.</span></p>
 

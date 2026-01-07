@@ -27,7 +27,7 @@
 
 
 <details open>
-<summary>裁剪图像并排展示</summary>
+<summary>裁剪图像并排预览</summary>
 
 <p align="center"><img src="figures/crop_grids.png" width="100%" alt="图像裁剪"><br><span style="color: #888; font-size: 12px;">图 1. 对比多个方法的图像框选区域。交互式选择需要可视化的区域（ROI），ICC 会自动对齐并排显示所有方法的对应区域。</span></p>
 
@@ -338,7 +338,7 @@ ROI选择的简要演示。
 - 在选择模式下拖拽绘制框；在位置模式下拖拽移动框。
 - 绘制ROI时按住 `Shift` 则会强制框为正方形。
 
-快速操作：
+快捷操作：
 - 右键点击重叠的ROI：选择重叠区域内的下一个框。
 - 右键点击ROI外：添加ROI（和按键 `a` 的功能一样）。
 - 在ROI内按住右键，然后离开该ROI，并释放鼠标，即可删除该ROI。
@@ -369,7 +369,7 @@ python compare.py --source external --dataset SDSD-indoor --pair pair13 --layout
 <a id="cli选项"></a>
 ### CLI选项 ⚙️
 <details open>
-<summary>核心开关</summary>
+<summary>文件路径</summary>
 
 - `--source`: `local` 或 `external`
 - `--root`: 工作空间根目录（本地模式）
