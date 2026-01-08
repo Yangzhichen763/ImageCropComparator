@@ -400,9 +400,14 @@ class InteractiveCropComparator:
             (255, 0, 255),  # magenta
             (255, 255, 0),  # cyan
             (255, 255, 255),  # white
-            (0, 165, 255),  # orange
-            (128, 128, 0),  # olive
+            (0, 128, 255),
+            (128, 255, 0),
+            (255, 0, 128),
+            (128, 0, 255),
+            (0, 255, 128),
+            (255, 128, 0),
         ]
+        self.color_darken_factor = 0.9
 
         self.line_color = (0, 0, 255)
         self.text_color = (0, 255, 0)
@@ -467,6 +472,7 @@ class InteractiveCropComparator:
         self._pre_drag_snapshot = None
         self.needs_update = True
         self._idle_return_mode = 'selection'
+        self.preview_mask_alpha = 0.1  # fill opacity for ROI preview
         # Mouse state
         self._rbutton_down_roi_id = None
         self._rbutton_left_roi = False
@@ -777,10 +783,26 @@ class InteractiveCropComparator:
             return np.full((height, width, 4), self.layout_bg_color, dtype=np.uint8)
         return np.full((height, width, 3), self.layout_bg_color, dtype=np.uint8)
 
-    def color_for_id(self, roi_id):
+    def _darken_color(self, color, steps):
+        if steps <= 0:
+            return tuple(color)
+        scale = self.color_darken_factor ** steps
+        bgr = [int(max(0, min(255, round(c * scale)))) for c in color[:3]]
+        if len(color) == 4:
+            bgr.append(color[3])
+        return tuple(bgr)
+
+    def color_for_id(self, roi_id, total_count=None):
         if not self.palette:
-            return (0, 0, 255)
-        return self.palette[(roi_id - 1) % len(self.palette)]
+            base = (0, 0, 255)
+        else:
+            base = self.palette[(roi_id - 1) % len(self.palette)]
+        try:
+            n = total_count if total_count is not None else len(self.rois)
+        except Exception:
+            n = len(self.rois)
+        steps = n // len(self.palette) if n > len(self.palette) else 0
+        return self._darken_color(base, steps)
 
     def rebuild_dataset(self, new_group, new_dataset):
         # Build new input folders based on method roots
@@ -1081,7 +1103,7 @@ class InteractiveCropComparator:
             self.mode = 'selection'
             self.selection_start = None
             return roi_id
-        color = self.color_for_id(roi_id)
+        color = self.color_for_id(roi_id, total_count=len(self.rois) + 1)
         self.rois[roi_id] = {'rect': None, 'color': color}
         self.active_roi = roi_id
         self.mode = 'selection'
@@ -1780,11 +1802,16 @@ class InteractiveCropComparator:
         if ref is None:
             return
         canvas = ref.copy()
+        overlay = canvas.copy()
+        overlay_applied = False
         if self.mode in ['selection', 'position'] and len(self.rois) > 0:
             for rid, r in sorted(self.rois.items()):
                 if r['rect'] is None:
                     continue
-                x1, y1, x2, y2 = r['rect']
+                x1, y1, x2, y2 = self.clamp_rect(r['rect'])
+                if x2 > x1 and y2 > y1:
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), r['color'], thickness=-1)
+                    overlay_applied = True
                 if self.mode == 'selection' and self.active_roi == rid:
                     self.draw_dashed_rect(canvas, (x1, y1), (x2, y2), r['color'], thickness=self.line_thickness)
                 else:
@@ -1796,6 +1823,9 @@ class InteractiveCropComparator:
                 else:
                     cv2.putText(canvas, f"{rid}", (x1 + 3, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, r['color'],
                                 2)
+        if overlay_applied:
+            alpha = max(0.0, min(1.0, float(self.preview_mask_alpha)))
+            cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, dst=canvas)
         # Top-left image name (without extension) for the interactive reference display
         try:
             ref_path = self.image_files[self.reference_key][self.current_frame]
@@ -1923,7 +1953,10 @@ class InteractiveCropComparator:
         self.rois = {}
         for rid, rect in loaded:
             x1, y1, x2, y2 = self.clamp_rect(rect)
-            self.rois[rid] = {'rect': (x1, y1, x2, y2), 'color': self.color_for_id(rid)}
+            self.rois[rid] = {
+                'rect': (x1, y1, x2, y2),
+                'color': self.color_for_id(rid, total_count=len(self.rois) + 1)
+            }
         self.active_roi = loaded[0][0]
         self.mode = 'position'
         self.selection_start = None
