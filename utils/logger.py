@@ -54,7 +54,7 @@ class Logger:
         'error': 40,
     }
 
-    def __init__(self, level: str = 'info', use_color: Optional[bool] = None, name: str = 'LLIE-Results'):
+    def __init__(self, level: str = 'info', use_color: Optional[bool] = None, name: str = ''):
         self.level = self.LEVELS.get(level, 20)
         # auto-enable color if not specified and stdout is a tty
         env_force = os.environ.get('FORCE_COLOR', '')

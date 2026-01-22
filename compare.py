@@ -490,11 +490,13 @@ class InteractiveCropComparator:
             try:
                 sample_ref = next(iter(self.image_files.values()))
                 sample_path = sample_ref[0] if sample_ref else next(iter(self.input_folders.values()))
-                norm = os.path.normpath(sample_path)
-                parts = norm.split(os.sep)
-                if len(parts) >= 2:
-                    self.dataset = parts[-2] if self.dataset is None else self.dataset
-                    self.group = parts[-3] if len(parts) >= 3 and self.group is None else self.group
+                method_name, method_root = next(iter(self.method_roots.items()))
+                rel_path = os.path.relpath(sample_path, os.path.join(method_root, method_name))
+                parts = rel_path.split(os.sep)[:-1] # exclude file name
+                if self.dataset is None and len(parts) >= 1:
+                    self.dataset = parts[-1]
+                if self.group is None and len(parts) >= 2:
+                    self.group = os.path.join(*parts[:-1])
             except Exception:
                 pass
 
@@ -804,13 +806,14 @@ class InteractiveCropComparator:
         steps = n // len(self.palette) if n > len(self.palette) else 0
         return self._darken_color(base, steps)
 
-    def rebuild_dataset(self, new_group, new_dataset):
+    def rebuild_dataset(self, new_dataset, new_group=None):
         # Build new input folders based on method roots
         if not self.method_roots:
             log.error("Dataset switching not supported for this layout")
             return False
+        label_path = f"{new_group}/{new_dataset}" if new_group else new_dataset
         log.info(
-            f"Switching dataset to {log.style_path(new_group)}/{log.style_path(new_dataset)} "
+            f"Switching dataset to {log.style_path(label_path)} "
             f"for {len(self.method_roots)} methods"
         )
         new_inputs = {}
@@ -818,7 +821,11 @@ class InteractiveCropComparator:
             if not method_root or not os.path.isdir(method_root):
                 log.warn(f"Cannot switch dataset for {log.style_path(name)} (missing method root)")
                 continue
-            cand = os.path.join(method_root, new_group, new_dataset)
+            # Handle None group for flat structures or dataset-only layouts
+            if new_group:
+                cand = os.path.join(method_root, name, new_group, new_dataset)
+            else:
+                cand = os.path.join(method_root, name, new_dataset)
             if not os.path.exists(cand):
                 log.warn(f"Missing folder for {log.style_path(name)} at {log.style_path(cand)}")
                 continue
@@ -829,7 +836,7 @@ class InteractiveCropComparator:
             new_inputs[name] = cand
 
         if not new_inputs:
-            log.error(f"Switch failed: no valid inputs for {log.style_path(new_group)}/{log.style_path(new_dataset)}")
+            log.error(f"Switch failed: no valid inputs for {log.style_path(label_path)}")
             return False
 
         # Update state
@@ -869,10 +876,19 @@ class InteractiveCropComparator:
         self.active_roi = None
         self.selection_start = None
         self.mode = 'selection'
+        # Close all existing grid windows before clearing the set
+        for w in list(self.grid_windows):
+            try:
+                cv2.destroyWindow(w)
+            except Exception:
+                pass
         self.grid_windows = set()
         self.add_roi()
         self._refresh_method_grid_sorting()
-        log.success(f"Switched to {log.style_path(new_group)}/{log.style_path(new_dataset)}")
+        if new_group:
+            log.success(f"Switched to {log.style_path(new_group)}/{log.style_path(new_dataset)}")
+        else:
+            log.success(f"Switched to {log.style_path(new_dataset)}")
         return True
 
     # ---- Grid ordering helpers ----
@@ -2176,17 +2192,14 @@ class InteractiveCropComparator:
                     text = ""
                 if text:
                     if '/' in text:
-                        ng, nd = text.split('/', 1)
+                        ng, nd = text.split('/', -1)
                     else:
-                        ng, nd = (self.group or ''), text
-                    if not ng:
-                        ng = self.group or ''
+                        ng, nd = None, text
+
                     if not nd:
-                        nd = self.dataset or ''
-                    if not ng or not nd:
-                        log.error("Group or dataset is empty; aborted switch")
+                        log.error("Dataset is empty; aborted switch")
                     else:
-                        if self.rebuild_dataset(ng, nd):
+                        if self.rebuild_dataset(nd, ng):
                             self.request_update()
                 else:
                     log.info("Dataset switch cancelled (empty input)")
@@ -2243,7 +2256,7 @@ if __name__ == "__main__":
         title='Dataset',
         description='Specify dataset location (group/dataset) and the video sequence (pair) for external mode.'
     )
-    g_dataset.add_argument('--group', '-g', default='SDSD-indoor+', type=str,
+    g_dataset.add_argument('--group', '-g', default=None, type=str,
                            help='Dataset group folder under each method (e.g., LOLv2-real+, SDSD-indoor+). Hyphens are auto-resolved across methods.')
     g_dataset.add_argument('--dataset', '-ds', default='SDSD-indoor', type=str,
                            help='Leaf dataset folder under the group (e.g., DarkFace, DICM, LOL, SDSD-indoor).')
