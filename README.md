@@ -6,6 +6,15 @@
 
 Image Crop Comparator (ICC): A research-oriented, interactive image crop comparator for pixel-level method analysis, designed for a fast and flexible interactive workflow with multi-ROI selection, auto layout, undo/redo, side-by-side ROI comparison, and more advanced options. 
 
+
+<div align="center">
+
+![Python](https://img.shields.io/badge/Python-3.8+-blue?logo=python&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey)
+![Status](https://img.shields.io/badge/Status-Research%20Tool-informational)
+
+</div>
+
 <div align="center">
 
 [![Gradio Spaces Demo](https://img.shields.io/badge/%F0%9F%A4%97%20Gradio%20-Demo-violet)](https://huggingface.co/spaces/OrangeC4709/ImageCropComparator)
