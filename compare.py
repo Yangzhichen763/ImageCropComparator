@@ -979,7 +979,7 @@ class InteractiveCropComparator:
                      f"{', '.join(f'{log.style_path(k)}->{v}' for k, v in self._method_srt_stems.items())}")
         else:
             missing = [k for k in methods if k not in self._method_srt_stems]
-            log.info(f"Not all methods have .srt files. Methods missing .srt files: {', '.join(log.style_path(k) for k in missing)}")
+            log.warn(f"Not all methods have .srt files. Methods missing .srt files: {', '.join(log.style_path(k) for k in missing)}")
         self._all_methods_have_srt = bool(all_have and len(self._method_srt_stems) == len(methods))
 
     def _ordered_method_keys_for_grid(self):
@@ -1520,13 +1520,49 @@ class InteractiveCropComparator:
             # place at the nearest corner to mirrored center
             corners = [(0, 0), (W - gw, 0), (0, H - gh), (W - gw, H - gh)]
 
+            def _norm_single_pos(raw_pos: str):
+                if raw_pos is None:
+                    return 'auto'
+                s = str(raw_pos).strip().lower()
+                if not s or s == 'auto':
+                    return 'auto'
+                mapping = {
+                    'tl': 'tl',
+                    'top-left': 'tl',
+                    'left-top': 'tl',
+                    'upper-left': 'tl',
+                    'tr': 'tr',
+                    'top-right': 'tr',
+                    'right-top': 'tr',
+                    'upper-right': 'tr',
+                    'bl': 'bl',
+                    'bottom-left': 'bl',
+                    'left-bottom': 'bl',
+                    'lower-left': 'bl',
+                    'br': 'br',
+                    'bottom-right': 'br',
+                    'right-bottom': 'br',
+                    'lower-right': 'br',
+                }
+                return mapping.get(s, 'auto')
+
             def dist2(ax, ay, bx, by):
                 dx = ax - bx
                 dy = ay - by
                 return dx * dx + dy * dy
 
-            best = min(corners, key=lambda c: dist2(c[0] + gw // 2, c[1] + gh // 2, ox, oy))
-            x0, y0 = best
+            pos = _norm_single_pos(getattr(self, 'single_crop_position', 'auto'))
+            if pos == 'tl':
+                x0, y0 = 0, 0
+            elif pos == 'tr':
+                x0, y0 = W - gw, 0
+            elif pos == 'bl':
+                x0, y0 = 0, H - gh
+            elif pos == 'br':
+                x0, y0 = W - gw, H - gh
+            else:
+                best = min(corners, key=lambda c: dist2(c[0] + gw // 2, c[1] + gh // 2, ox, oy))
+                x0, y0 = best
             out = ref.copy()
             out[y0:y0 + gh, x0:x0 + gw] = crop
             # draw ROI box on full image and crop box in final
@@ -2258,6 +2294,9 @@ if __name__ == "__main__":
                           help='Gap (in pixels) between base image and crop block, and between crops themselves (default: 10).')
     g_layout.add_argument('--layout-bg-color', default='transparent', type=str,
                           help='Padding/background color as R,G,B[,A] for final layout gaps, or "transparent" (default). e.g., 0,0,0 or 255,255,255,255.')
+    g_layout.add_argument('--single-crop-position', default='auto', type=str,
+                            help='When there is only 1 ROI/crop, control where that crop is placed in the final layout. '
+                                 'Supported: auto (default), tl/tr/bl/br, top-left/top-right/bottom-left/bottom-right.')
 
     # --- ROI / drawing ---
     g_roi = parser.add_argument_group(
@@ -2353,6 +2392,9 @@ if __name__ == "__main__":
         except Exception:
             pass
 
+        if not methods:
+            raise ValueError("No methods found under root; please specify methods.txt or add method folders.")
+
         methods, removed = _apply_exclude(methods, exclude_methods)
         if removed:
             try:
@@ -2424,6 +2466,7 @@ if __name__ == "__main__":
     )
     comparator.mode = args.mode
     comparator.layout_mode = args.layout
+    comparator.single_crop_position = args.single_crop_position
     comparator.preview_key = args.preview or ('GT' if 'GT' in input_folder else (
         'input' if 'input' in input_folder else next(iter(input_folder.keys()))))
     # Sorting options for final layout
