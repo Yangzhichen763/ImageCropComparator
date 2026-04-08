@@ -16,10 +16,12 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     _natsorted = sorted
 
-IMG_EXTS = ['png', 'jpg', 'jpeg']
+IMG_EXTS = ['png', 'jpg', 'jpeg', 'bmp', 'ppm']
 
 
 def is_hidden_path(path):
+    if '.me' in path:
+        return False
     parts = os.path.normpath(path or '').split(os.sep)
     return any(part.startswith('.') for part in parts if part not in ('', '.', '..'))
 
@@ -72,7 +74,7 @@ except Exception:
     log = _FallbackLogger()
 
 try:
-    from utils.io import glob_single_files
+    from utils.io import glob_single_files, read_images_as_numpy
 except Exception:
     from PIL import Image  # noqa: F401
 
@@ -102,13 +104,39 @@ except Exception:
     def glob_single_files(directory, file_extensions, path_handler=PathHandler.get_vanilla_path):
         if isinstance(file_extensions, str):
             file_extensions = [file_extensions]
-        raw_paths = []
-        for file_extension in file_extensions:
-            pattern = os.path.join(directory, f"**/*.{file_extension}")
-            raw_paths += _natsorted(glob(pattern, recursive=True))
-        raw_paths = [os.path.normpath(path) for path in raw_paths]
-        file_paths = [path_handler(path) for path in raw_paths if not is_hidden_path(path)]
+
+        file_paths = []
+
+        directory = glob.escape(directory)
+
+        if os.path.isdir(directory):
+            for file_extension in file_extensions:
+                pattern = os.path.join(directory, f"**/*.{file_extension}")
+                file_paths.extend(glob.glob(pattern, recursive=True))
+        else:
+            for file_extension in file_extensions:
+                pattern = f"{directory}*.{file_extension}"
+                file_paths.extend(glob.glob(pattern))
+
+        file_paths = _natsorted(set(os.path.normpath(p) for p in file_paths))
+        file_paths = [path_handler(p) for p in file_paths]
         return file_paths
+
+
+    def read_images_as_numpy(*paths, read_mode=cv2.IMREAD_UNCHANGED):
+        if isinstance(paths, str):
+            paths = [paths]
+        images = []
+        for path in paths:
+            image = cv2.imread(path, read_mode)
+            if image is None:
+                raise FileNotFoundError(f'Failed to read image: "{path}"')
+            if image.ndim == 2:
+                image = np.expand_dims(image, axis=2)
+            elif image.shape[2] > 3:
+                image = image[:, :, :3]
+            images.append(image)
+        return images if len(images) > 1 else images[0]
 
 
 def emphasize(text):
@@ -362,20 +390,21 @@ class InteractiveCropComparator:
                 self.method_roots[name] = self._infer_method_root(src, files)
 
         keys = list(self.image_files.keys())
+        reference_keys = ['GT', 'input', 'reference', 'ref', 'gt', 'lq', 'hq', 'Input', 'Reference']
         if reference_key is None:
-            if 'GT' in self.image_files:
-                reference_key = 'GT'
-            elif 'input' in self.image_files:
-                reference_key = 'input'
-            else:
+            for rk in reference_keys:
+                if rk in self.image_files and len(self.image_files[rk]) > 0:
+                    reference_key = rk
+                    break
+            if reference_key is None and keys:
                 reference_key = keys[0]
         self.reference_key = reference_key
 
         if len(self.image_files[self.reference_key]) == 0:
-            raise ValueError(f"Reference folder has no images: {self.input_folders[self.reference_key]}")
+            raise ValueError(f"Reference folder has no images, ref keys: {self.reference_key}, image files: {self.image_files[self.reference_key]}, input files: {self.input_folders[self.reference_key]}")
 
         self.num_frames = len(self.image_files[self.reference_key])
-        sample = cv2.imread(self.image_files[self.reference_key][0])
+        sample = read_images_as_numpy(self.image_files[self.reference_key][0])
         if sample is None:
             raise ValueError("Failed to read reference sample image")
         self.height, self.width = sample.shape[:2]
@@ -485,20 +514,60 @@ class InteractiveCropComparator:
         # Grid display ordering / optional .srt-based sorting
         self._method_srt_stems = {}
         self._all_methods_have_srt = False
-        # Derive group/dataset if not provided
+        # Derive dataset/group by reversing path parts across all inputs.
+        # Rules:
+        # - only 1 common tail folder: dataset=<folder>, group=None
+        # - 2+ common tail folders: dataset=<1st>, group=<2nd>
         if self.group is None or self.dataset is None:
             try:
-                sample_ref = next(iter(self.image_files.values()))
-                sample_path = sample_ref[0] if sample_ref else next(iter(self.input_folders.values()))
-                method_name, method_root = next(iter(self.method_roots.items()))
-                rel_path = os.path.relpath(sample_path, os.path.join(method_root, method_name))
-                parts = rel_path.split(os.sep)[:-1] # exclude file name
-                if self.dataset is None and len(parts) >= 1:
-                    self.dataset = parts[-1]
-                if self.group is None and len(parts) >= 2:
-                    self.group = os.path.join(*parts[:-1])
+                dir_parts_list = []
+                for _, src in self.input_folders.items():
+                    if isinstance(src, str) and src:
+                        norm = os.path.normpath(src)
+                        parts = [p for p in norm.split(os.sep) if p and p != '.']
+                        if parts:
+                            dir_parts_list.append(parts)
+                    elif isinstance(src, (list, tuple)) and len(src) > 0:
+                        first_path = src[0]
+                        if isinstance(first_path, str) and first_path:
+                            norm_dir = os.path.normpath(os.path.dirname(first_path))
+                            parts = [p for p in norm_dir.split(os.sep) if p and p != '.']
+                            if parts:
+                                dir_parts_list.append(parts)
+
+                inferred_dataset = None
+                inferred_group = None
+                if dir_parts_list:
+                    rev_lists = [list(reversed(parts)) for parts in dir_parts_list]
+                    min_len = min(len(rp) for rp in rev_lists)
+                    common_tail = []
+                    for i in range(min_len):
+                        token = rev_lists[0][i]
+                        if all(rp[i] == token for rp in rev_lists[1:]):
+                            common_tail.append(token)
+                        else:
+                            break
+
+                    if len(common_tail) >= 1:
+                        inferred_dataset = common_tail[0]
+                    if len(common_tail) >= 2:
+                        inferred_group = common_tail[1]
+                    # Fallback rule:
+                    # if the 1st tail folder differs but the 2nd is the same,
+                    # use the 2nd as dataset and keep group empty.
+                    if len(common_tail) == 0 and min_len >= 2:
+                        second_token = rev_lists[0][1]
+                        if all(rp[1] == second_token for rp in rev_lists[1:]):
+                            inferred_dataset = second_token
+                            inferred_group = None
+
+                if self.dataset is None and inferred_dataset:
+                    self.dataset = inferred_dataset
+                if self.group is None:
+                    self.group = inferred_group
             except Exception:
                 pass
+        print(f"Inferred dataset: {log.style_key(self.dataset)}, group: {log.style_key(self.group)} from input paths.")
 
         self._refresh_method_grid_sorting()
 
@@ -558,8 +627,20 @@ class InteractiveCropComparator:
         )
 
     # ---- State setters ----
+    def _refresh_current_frame_bounds(self):
+        """Refresh interaction bounds from the current reference frame size."""
+        try:
+            img = self.read_frame(self.reference_key, self.current_frame)
+            if img is not None:
+                h, w = img.shape[:2]
+                self.height, self.width = h, w
+        except Exception:
+            # Keep previous bounds if current frame cannot be read.
+            pass
+
     def _set_frame(self, idx):
         self.current_frame = max(0, min(self.num_frames - 1, idx))
+        self._refresh_current_frame_bounds()
         self.request_update()
 
     def _set_layout(self, mode):
@@ -863,7 +944,7 @@ class InteractiveCropComparator:
         if len(self.image_files[self.reference_key]) == 0:
             log.error("Reference folder empty after switch")
             return False
-        sample = cv2.imread(self.image_files[self.reference_key][0])
+        sample = read_images_as_numpy(self.image_files[self.reference_key][0])
         if sample is None:
             log.error("Failed to read reference sample after switch")
             return False
@@ -1014,6 +1095,9 @@ class InteractiveCropComparator:
                     middle = sorted(middle, key=lambda k: (self._method_srt_stems.get(k, ''), str(k)))
             except Exception:
                 pass
+        elif middle:
+            # Fallback: when .srt ordering is unavailable, keep a stable name-based order.
+            middle = _natsorted(middle)
 
         return input_keys + middle + gt_keys
 
@@ -1031,7 +1115,7 @@ class InteractiveCropComparator:
             log.warn(
                 f"Image {log.style_path(name)} not found; staying on {log.style_path(os.path.basename(files[self.current_frame])) if files else 'N/A'}")
             return False
-        self.current_frame = target
+        self._set_frame(target)
         log.success(f"Jumped to image {log.style_path(os.path.basename(files[self.current_frame]))}")
         return True
 
@@ -1332,7 +1416,7 @@ class InteractiveCropComparator:
         files = self.image_files[key]
         if idx < 0 or idx >= len(files):
             idx = max(0, min(len(files) - 1, idx))
-        img = cv2.imread(files[idx])
+        img = read_images_as_numpy(files[idx])
         return img
 
     def build_grid_for_rect(self, rect, roi_color=None):
@@ -1368,6 +1452,14 @@ class InteractiveCropComparator:
                 label_color = tuple(int(v) for v in roi_color[:3])
         except Exception:
             label_color = (0, 255, 0)
+        # Keep text size visually stable when grid window is magnified.
+        try:
+            scale_for_text = float(self.display_scale) if float(self.display_scale) > 0 else 1.0
+        except Exception:
+            scale_for_text = 1.0
+        text_scale = 0.35 / scale_for_text
+        text_thickness = max(1, int(round(1 / scale_for_text)))
+        text_y = max(12, int(round(12 / scale_for_text)))
 
         for i, name in enumerate(method_keys):
             img = self.read_frame(name, self.current_frame)
@@ -1423,7 +1515,16 @@ class InteractiveCropComparator:
                 grid_alpha[y0:y0 + roi_h, x0:x0 + roi_w] = crop_alpha
             
             # Draw text on RGB part
-            cv2.putText(grid_rgb, name, (x0 + 2, y0 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, label_color, 1, lineType=cv2.LINE_AA)
+            cv2.putText(
+                grid_rgb,
+                name,
+                (x0 + 2, y0 + text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                text_scale,
+                label_color,
+                text_thickness,
+                lineType=cv2.LINE_AA,
+            )
         
         # Combine RGB and alpha if needed
         if self.layout_use_alpha and grid_alpha is not None:
@@ -2028,9 +2129,10 @@ class InteractiveCropComparator:
         # Use reference image stem as the per-frame output folder name
         try:
             ref_file_for_dir = self.image_files[self.reference_key][self.current_frame]
-            ref_stem_for_dir = os.path.basename(ref_file_for_dir).rsplit('.', 1)[0]
-            frame_dir = os.path.join(base_dir, ref_stem_for_dir)
+            ref_name = os.path.basename(ref_file_for_dir).rsplit('.', 1)[0]
+            frame_dir = os.path.join(base_dir, ref_name)
         except Exception:
+            ref_name = ""
             frame_dir = base_dir
         os.makedirs(frame_dir, exist_ok=True)
 
@@ -2042,27 +2144,34 @@ class InteractiveCropComparator:
 
         # For each method: save final layout, per-ROI crops, and original image
         for m in method_keys:
-            img_file = self.image_files[m][self.current_frame]
+            try:
+                img_file = self.image_files[m][self.current_frame]
+            except Exception:
+                log.warn(f"Method {m} has no image for current frame; skipping")
+                continue
             img_name = os.path.basename(img_file).rsplit('.', 1)[0]
-            m_dir = os.path.join(base_dir, img_name)
-            os.makedirs(m_dir, exist_ok=True)
+            if ref_name != img_name:
+                m_suffix = f"_{img_name}"
+            else:
+                m_suffix = ""
+            m_dir = frame_dir
             img = self.read_frame(m, self.current_frame)
             if img is None:
-                log.warn(f"Skip method {m}: image read failed")
+                log.warn(f"Skip method {m}{m_suffix}: image read failed")
                 continue
             H, W = img.shape[:2]
 
             # Save original image
-            orig_out = os.path.join(m_dir, f"orig_{m}.png")
+            orig_out = os.path.join(m_dir, f"orig_{m}{m_suffix}.png")
             cv2.imwrite(orig_out, img)
 
             # Save final layout composed for this method
             final = self.build_final_layout_for_key(m, sort_mode=self.sort_mode, reverse_sort=self.sort_reverse)
             if final is not None:
-                final_out = os.path.join(m_dir, f"final_{m}.png")
+                final_out = os.path.join(m_dir, f"final_{m}{m_suffix}.png")
                 cv2.imwrite(final_out, final)
             else:
-                log.warn(f"Final layout for {m} is empty; skipping")
+                log.warn(f"Final layout for {m}{m_suffix} is empty; skipping")
 
             # Save each ROI crop for this method
             for rid, r in sorted(self.rois.items()):
@@ -2102,7 +2211,7 @@ class InteractiveCropComparator:
                         padded[:ph, :pw] = crop[:ph, :pw]
                         crop = padded
                 
-                crop_out = os.path.join(m_dir, f"crop_roi{rid}_{m}.png")
+                crop_out = os.path.join(m_dir, f"crop_roi{rid}_{m}{m_suffix}.png")
                 cv2.imwrite(crop_out, crop)
 
         # Save grid images (per-ROI and all-ROIs) once per frame
@@ -2246,7 +2355,7 @@ if __name__ == "__main__":
     )
     g_data.add_argument('--source', choices=['local', 'external'], default='local', type=str,
                         help='Data source: local uses the workspace structure under --root; external uses /data/user paths with --pair videos.')
-    g_data.add_argument('--root', '-r', default='./examples', type=str,
+    g_data.add_argument('--root', '-r', default=r'E:\Documents\master\projects\BASICTransform - backups\visio Figs\imgs\Results\SDSD-indoor', type=str,
                         help='Workspace root containing method folders (local mode only). Example: /mnt/user/results/LLIE-results')
     g_data.add_argument('--output', '-o', default='./crop_grids/', type=str,
                         help='Root output folder. Files are saved under output/<timestamp>/<dataset>/...')
@@ -2258,9 +2367,9 @@ if __name__ == "__main__":
     )
     g_dataset.add_argument('--group', '-g', default=None, type=str,
                            help='Dataset group folder under each method (e.g., LOLv2-real+, SDSD-indoor+). Hyphens are auto-resolved across methods.')
-    g_dataset.add_argument('--dataset', '-ds', default='SDSD-indoor', type=str,
+    g_dataset.add_argument('--dataset', '-ds', default=None, type=str,
                            help='Leaf dataset folder under the group (e.g., DarkFace, DICM, LOL, SDSD-indoor).')
-    g_dataset.add_argument('--pair', '-p', default='pair13', type=str,
+    g_dataset.add_argument('--pair', '-p', default=None, type=str,
                            help='Video pair/sequence name (external mode only), e.g., pair13. Ignored in local mode.')
 
     # --- Method discovery / filtering ---
@@ -2285,7 +2394,7 @@ if __name__ == "__main__":
                         help='Number of columns in the per-ROI method grid view (rows are computed automatically). If not specified and there are >=9 methods, auto-computed as (num_methods+1)//2.')
     g_view.add_argument('--grid-gap', default=2, type=int,
                         help='Gap (in pixels) between tiles in per-ROI method grid windows (default: 2).')
-    g_view.add_argument('--magnify', '--scale', default=2.0, type=float,
+    g_view.add_argument('--magnify', '--scale', default=2, type=float,
                         help='Display-only magnification for crop grid windows. Final preview is not globally scaled; multi-ROI ignores this.')
 
     # --- Final layout preview ---
@@ -2464,8 +2573,7 @@ if __name__ == "__main__":
     comparator = InteractiveCropComparator(
         input_folder,
         output_folder=args.output,
-        reference_key=('GT' if 'GT' in input_folder else (
-            'input' if 'input' in input_folder else next(iter(input_folder.keys())))),
+        reference_key=None,
         columns=args.columns,
         grid_gap=args.grid_gap,
         display_scale=args.magnify,
