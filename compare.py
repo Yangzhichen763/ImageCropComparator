@@ -1,13 +1,21 @@
 import copy
+import concurrent.futures
 import math
 import os
 import sys
+import threading
 import time
+import warnings
 from datetime import datetime
 from glob import glob
 
 import cv2
 import numpy as np
+
+try:
+    from matplotlib import pyplot as plt
+except Exception:  # pragma: no cover - optional dependency
+    plt = None
 
 from typing import Union, Tuple
 
@@ -337,6 +345,960 @@ def discover_local_inputs(root, methods, group=None, dataset=None, pair=None, st
     return {}
 
 
+class AsyncPsnrFeature:
+    """Optional PSNR feature module, attached through event_on_init."""
+
+    def __init__(self, host, refresh_interval_sec=0.5, max_workers=4):
+        self.host = host
+        self.window_psnr = "PSNR Curves"
+        self.host.window_psnr = self.window_psnr
+
+        self._plot_image = None
+        self._plot_image_base = None
+        self._plot_line_meta = None
+        self._cache_token = None
+        self._dirty = True
+        self._warned = False
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        self._render_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._pending_futures = {}
+        self._pending_token = None
+        self._lock = threading.Lock()
+        self.values = {}
+        self._values_n = 0
+        self._values_dataset = None
+        self._values_ref = None
+        self._last_refresh_ts = 0.0
+        self._refresh_interval_sec = float(refresh_interval_sec)
+        self._legend_hitboxes = []
+        self._highlight_methods = set()
+        self._psnr_mouse_bound = False
+        self._last_render_frame_idx = -1
+        self._last_render_highlight = set()
+        self._psnr_jump_armed = False
+        self._completion_signal_lock = threading.Lock()
+        self._completed_signal_count = 0
+        self._render_lock = threading.Lock()
+        self._render_future = None
+        self._render_staged_request = None
+        self._render_seq = 0
+        self._completed_since_last_render = 0
+        self._mpl_cache = None
+
+        # Rendering is done in a worker thread on purpose; suppress this noisy warning.
+        warnings.filterwarnings(
+            "ignore",
+            message="Starting a Matplotlib GUI outside of the main thread will likely fail.*",
+            category=UserWarning,
+        )
+
+        self.host.register_event_handler('after_update_display', self.on_after_update_display)
+        self.host.register_event_handler('on_rebuild_dataset', self.on_rebuild_dataset)
+        self.host.register_event_handler('on_shutdown', self.on_shutdown)
+        self._start_async_compute()
+
+    def _on_psnr_mouse(self, event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+
+        # Two-click jump mode:
+        # 1) click near current dashed line to arm.
+        # 2) click again on plot to jump to target index.
+        if self._point_in_plot_area(x, y):
+            if self._psnr_jump_armed:
+                target_idx = self._x_to_frame_index(x)
+                self._psnr_jump_armed = False
+                if target_idx is not None:
+                    self._jump_to_frame_index(target_idx)
+                self._dirty = True
+                self.host.request_update()
+                return
+
+            marker_x = self._current_marker_x_px()
+            if marker_x is not None and abs(int(x) - int(marker_x)) <= 6:
+                self._psnr_jump_armed = True
+                self._dirty = True
+                self.host.request_update()
+                log.note("PSNR jump armed: click target x on plot to jump frame")
+                return
+
+        if self._psnr_jump_armed and (not self._point_in_plot_area(x, y)):
+            self._psnr_jump_armed = False
+            self._dirty = True
+            self.host.request_update()
+
+        # In plot area, always prioritize curve picking to avoid legend near-hit stealing.
+        if self._point_in_plot_area(x, y):
+            clicked_method = self._pick_method_on_plot(x, y)
+        else:
+            clicked_method = self._pick_method_on_legend(x, y)
+            if clicked_method is None:
+                clicked_method = self._pick_method_on_plot(x, y)
+        if clicked_method is None:
+            if self._highlight_methods:
+                self._highlight_methods.clear()
+                self._dirty = True
+                self.host.request_update()
+            return
+
+        shift_on = bool(flags & cv2.EVENT_FLAG_SHIFTKEY)
+        if shift_on:
+            if clicked_method in self._highlight_methods:
+                self._highlight_methods.remove(clicked_method)
+            else:
+                self._highlight_methods.add(clicked_method)
+        else:
+            if len(self._highlight_methods) == 1 and clicked_method in self._highlight_methods:
+                self._highlight_methods.clear()
+            else:
+                self._highlight_methods = {clicked_method}
+
+        self._dirty = True
+        self.host.request_update()
+
+    def _point_in_plot_area(self, x, y):
+        meta = self._plot_line_meta or {}
+        x_min = int(meta.get('x_min', 0))
+        x_max = int(meta.get('x_max', -1))
+        y_min = int(meta.get('y_min', 0))
+        y_max = int(meta.get('y_max', -1))
+        if x_max < x_min:
+            x_min, x_max = x_max, x_min
+        if y_max < y_min:
+            y_min, y_max = y_max, y_min
+        return x_min <= int(x) <= x_max and y_min <= int(y) <= y_max
+
+    def _x_to_frame_index(self, x):
+        meta = self._plot_line_meta or {}
+        n = int(meta.get('n', 0))
+        if n <= 0:
+            return None
+        x_min = int(meta.get('x_min', 0))
+        x_max = int(meta.get('x_max', -1))
+        if x_max < x_min:
+            x_min, x_max = x_max, x_min
+        if x_max <= x_min:
+            return 0
+        ratio_x = float(int(x) - x_min) / float(max(1, x_max - x_min))
+        idx = int(round(max(0.0, min(1.0, ratio_x)) * float(n - 1)))
+        return max(0, min(n - 1, idx))
+
+    def _current_marker_x_px(self):
+        frame_idx = int(getattr(self.host, 'current_frame', 0))
+        meta = self._plot_line_meta or {}
+        n = int(meta.get('n', 0))
+        if n <= 0:
+            return None
+        x_min = int(meta.get('x_min', 0))
+        x_max = int(meta.get('x_max', -1))
+        if x_max < x_min:
+            x_min, x_max = x_max, x_min
+        if n <= 1 or x_max == x_min:
+            return x_min
+        idx = max(0, min(n - 1, frame_idx))
+        ratio = float(idx) / float(n - 1)
+        return int(round(x_min + ratio * float(x_max - x_min)))
+
+    def _jump_to_frame_index(self, idx):
+        try:
+            idx = int(idx)
+        except Exception:
+            return
+        if idx < 0:
+            idx = 0
+
+        num_frames = int(getattr(self.host, 'num_frames', 0) or 0)
+        if num_frames > 0:
+            idx = min(num_frames - 1, idx)
+
+        set_frame_fn = getattr(self.host, '_set_frame', None)
+        if callable(set_frame_fn):
+            set_frame_fn(idx)
+        else:
+            self.host.current_frame = idx
+            req_fn = getattr(self.host, 'request_update', None)
+            if callable(req_fn):
+                req_fn()
+
+        try:
+            ref_files = self.host.image_files.get(self.host.reference_key, [])
+            if 0 <= idx < len(ref_files):
+                name = os.path.basename(ref_files[idx])
+                log.success(f"Jumped to frame #{idx + 1}: {name}")
+            else:
+                log.success(f"Jumped to frame #{idx + 1}")
+        except Exception:
+            log.success(f"Jumped to frame #{idx + 1}")
+
+    def _pick_method_on_legend(self, x, y):
+        if not self._legend_hitboxes:
+            return None
+
+        best_method = None
+        best_dist2 = None
+        for hb in self._legend_hitboxes:
+            x1 = int(hb.get('x1', 0))
+            x2 = int(hb.get('x2', -1))
+            y1 = int(hb.get('y1', 0))
+            y2 = int(hb.get('y2', -1))
+            if x2 < x1:
+                x1, x2 = x2, x1
+            if y2 < y1:
+                y1, y2 = y2, y1
+
+            dx = 0
+            if x < x1:
+                dx = x1 - x
+            elif x > x2:
+                dx = x - x2
+
+            dy = 0
+            if y < y1:
+                dy = y1 - y
+            elif y > y2:
+                dy = y - y2
+
+            dist2 = dx * dx + dy * dy
+            if best_dist2 is None or dist2 < best_dist2:
+                best_dist2 = dist2
+                best_method = hb.get('method')
+
+        if best_method is None:
+            return None
+
+        # Accept exact hit, or near-hit around legend cells.
+        # Use tighter vertical tolerance to prevent clicks above legend from snapping to it.
+        if best_dist2 == 0:
+            return best_method
+
+        best_dist = math.sqrt(float(best_dist2)) if best_dist2 is not None else float('inf')
+        if best_dist <= 14:
+            best_hb = None
+            # Re-find the nearest hb to inspect directional distance constraints.
+            nearest_dist2 = None
+            for hb in self._legend_hitboxes:
+                x1 = int(hb.get('x1', 0))
+                x2 = int(hb.get('x2', -1))
+                y1 = int(hb.get('y1', 0))
+                y2 = int(hb.get('y2', -1))
+                if x2 < x1:
+                    x1, x2 = x2, x1
+                if y2 < y1:
+                    y1, y2 = y2, y1
+
+                dx = 0
+                if x < x1:
+                    dx = x1 - x
+                elif x > x2:
+                    dx = x - x2
+
+                dy = 0
+                if y < y1:
+                    dy = y1 - y
+                elif y > y2:
+                    dy = y - y2
+
+                d2 = dx * dx + dy * dy
+                if nearest_dist2 is None or d2 < nearest_dist2:
+                    nearest_dist2 = d2
+                    best_hb = (dx, dy)
+
+            if best_hb is not None:
+                dx, dy = best_hb
+                if dy <= 6 and dx <= 20:
+                    return best_method
+        return None
+
+    def _pick_method_on_plot(self, x, y):
+        meta = self._plot_line_meta or {}
+        n = int(meta.get('n', 0))
+        if n <= 0:
+            return None
+
+        x_min = int(meta.get('x_min', 0))
+        x_max = int(meta.get('x_max', -1))
+        y_min = int(meta.get('y_min', 0))
+        y_max = int(meta.get('y_max', -1))
+        if x_max <= x_min or y_max <= y_min:
+            return None
+        if not (x_min <= x <= x_max and y_min <= y <= y_max):
+            return None
+
+        if n <= 1:
+            idx_f = 0.0
+        else:
+            ratio_x = float(x - x_min) / float(max(1, x_max - x_min))
+            idx_f = max(0.0, min(float(n - 1), ratio_x * float(n - 1)))
+
+        y_data_min = float(meta.get('y_data_min', 0.0))
+        y_data_max = float(meta.get('y_data_max', 50.0))
+        if y_data_max <= y_data_min:
+            y_data_min, y_data_max = 0.0, 50.0
+
+        def value_to_y_px(val):
+            ratio_y = (float(val) - y_data_min) / float(y_data_max - y_data_min)
+            ratio_y = max(0.0, min(1.0, ratio_y))
+            return int(round(y_max - ratio_y * float(y_max - y_min)))
+
+        def interp_y_at_index(series, target_idx, search_radius=6):
+            if series is None or len(series) == 0:
+                return None
+            if n <= 1:
+                v0 = float(series[0]) if len(series) > 0 else np.nan
+                return value_to_y_px(v0) if np.isfinite(v0) else None
+
+            i0 = int(math.floor(target_idx))
+            i1 = int(math.ceil(target_idx))
+            i0 = max(0, min(len(series) - 1, i0))
+            i1 = max(0, min(len(series) - 1, i1))
+
+            left = None
+            right = None
+
+            for d in range(search_radius + 1):
+                li = i0 - d
+                if li >= 0:
+                    lv = float(series[li])
+                    if np.isfinite(lv):
+                        left = (li, lv)
+                        break
+
+            for d in range(search_radius + 1):
+                ri = i1 + d
+                if ri < len(series):
+                    rv = float(series[ri])
+                    if np.isfinite(rv):
+                        right = (ri, rv)
+                        break
+
+            if left is None and right is None:
+                return None
+            if left is None:
+                return value_to_y_px(right[1])
+            if right is None:
+                return value_to_y_px(left[1])
+
+            li, lv = left
+            ri, rv = right
+            if ri == li:
+                return value_to_y_px(lv)
+
+            t = (target_idx - float(li)) / float(ri - li)
+            t = max(0.0, min(1.0, t))
+            interp_v = lv + (rv - lv) * t
+            return value_to_y_px(interp_v)
+
+        best_method = None
+        best_dist = float('inf')
+        with self._lock:
+            for method_name, series in self.values.items():
+                y_px = interp_y_at_index(series, idx_f)
+                if y_px is None:
+                    continue
+                dist = abs(int(y) - y_px)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_method = method_name
+
+        # Keep picking strict to avoid accidental highlight when clicking empty region.
+        if best_method is None or best_dist > 16:
+            return None
+        return best_method
+
+    def _build_cache_token(self):
+        items = tuple(sorted((str(k), len(v) if isinstance(v, (list, tuple)) else 0)
+                             for k, v in self.host.image_files.items()))
+        return (self.host.dataset, self.host.reference_key, items)
+
+    @staticmethod
+    def _normalize_for_psnr(img):
+        if img is None:
+            return None
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif img.ndim == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        elif img.ndim == 3 and img.shape[2] > 3:
+            img = img[:, :, :3]
+        if img.dtype != np.uint8:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+        return img
+
+    @staticmethod
+    def _compute_one_psnr(ref_path, cmp_path):
+        ref_img = read_images_as_numpy(ref_path)
+        cmp_img = read_images_as_numpy(cmp_path)
+        ref_img = AsyncPsnrFeature._normalize_for_psnr(ref_img)
+        cmp_img = AsyncPsnrFeature._normalize_for_psnr(cmp_img)
+        if ref_img is None or cmp_img is None:
+            return np.nan
+        if cmp_img.shape[:2] != ref_img.shape[:2]:
+            cmp_img = cv2.resize(cmp_img, (ref_img.shape[1], ref_img.shape[0]), interpolation=cv2.INTER_LINEAR)
+        return float(cv2.PSNR(cmp_img, ref_img))
+
+    def _compute_one_psnr_task(self, token, method_key, index, ref_path, cmp_path):
+        try:
+            value = self._compute_one_psnr(ref_path, cmp_path)
+            return token, method_key, index, value
+        except Exception:
+            return token, method_key, index, np.nan
+
+    def _on_future_done(self, _fut):
+        with self._completion_signal_lock:
+            self._completed_signal_count += 1
+
+    @staticmethod
+    def _draw_vertical_dashed_line(img, x, y1, y2, color, thickness=1, dash_len=6, gap_len=6):
+        if img is None:
+            return
+        h, w = img.shape[:2]
+        x = max(0, min(w - 1, int(x)))
+        y1 = max(0, min(h - 1, int(y1)))
+        y2 = max(0, min(h - 1, int(y2)))
+        if y2 < y1:
+            y1, y2 = y2, y1
+        pos = y1
+        while pos <= y2:
+            seg_end = min(y2, pos + dash_len)
+            cv2.line(img, (x, pos), (x, seg_end), color, thickness, lineType=cv2.LINE_AA)
+            pos += dash_len + gap_len
+
+    def _compose_plot_with_frame_line(self, frame_idx):
+        if self._plot_image_base is None:
+            return None
+        out = self._plot_image_base.copy()
+        meta = self._plot_line_meta or {}
+        n = int(meta.get('n', 0))
+        if n <= 0:
+            return out
+
+        x_min = int(meta.get('x_min', 0))
+        x_max = int(meta.get('x_max', 0))
+        y_min = int(meta.get('y_min', 0))
+        y_max = int(meta.get('y_max', out.shape[0] - 1))
+        if x_max < x_min:
+            x_min, x_max = x_max, x_min
+
+        current_idx = int(frame_idx) + 1
+        current_idx = max(1, min(max(1, n), current_idx))
+        if n <= 1 or x_max == x_min:
+            x_px = x_min
+        else:
+            ratio = float(current_idx - 1) / float(n - 1)
+            x_px = int(round(x_min + ratio * (x_max - x_min)))
+
+        self._draw_vertical_dashed_line(
+            out,
+            x=x_px,
+            y1=y_min,
+            y2=y_max,
+            color=(64, 64, 255),
+            thickness=(3 if self._psnr_jump_armed else 1),
+            dash_len=7,
+            gap_len=5,
+        )
+        return out
+
+    def _reset_mpl_cache(self):
+        cache = self._mpl_cache
+        self._mpl_cache = None
+        if not cache:
+            return
+        fig = cache.get('fig')
+        if fig is not None:
+            try:
+                plt.close(fig)
+            except Exception:
+                pass
+
+    def _render_plot_image(self, psnr_series, n, dataset_name, reference_key, current_frame_idx, highlight_methods):
+        # ---- 0) Guard clauses: rendering backend and data availability ----
+        if plt is None:
+            if not self._warned:
+                log.warn("matplotlib is not available; PSNR curve window is disabled")
+                self._warned = True
+            return None
+        if n <= 0 or not psnr_series:
+            return None
+
+        # ---- 1) Figure/canvas baseline configuration ----
+        # Render on a larger physical canvas first to avoid tiny-font collapse.
+        fig_w_in = 20.0
+        plot_h_in = 6.0
+        render_dpi = 80
+        x = np.arange(1, n + 1)
+        # ---- 2) Prepare per-method series metadata (values, color, legend label) ----
+        cmap = plt.get_cmap('tab20')
+        other_idx = 0
+        finite_values = []
+        series_items = []
+        for name, ys in psnr_series.items():
+            y_arr = np.array(ys, dtype=float)
+            finite = y_arr[np.isfinite(y_arr)]
+            if finite.size > 0:
+                finite_values.append(finite)
+
+            name_l = str(name).strip().lower()
+            if name_l == 'lq':
+                color = (0.0, 0.0, 0.0)
+            elif name_l == 'gt':
+                color = (1.0, 0.0, 0.0)
+            else:
+                color = cmap(other_idx % 20)
+                other_idx += 1
+            if isinstance(color, (tuple, list, np.ndarray)) and len(color) >= 3:
+                color = (float(color[0]), float(color[1]), float(color[2]))
+
+            legend_name = str(name)
+            if len(legend_name) > 18:
+                legend_name = legend_name[:15] + '...'
+            series_items.append((str(name), legend_name, y_arr, color))
+
+        labels = [item[0] for item in series_items]
+        if labels:
+            ncol = 8
+            legend_rows = int(math.ceil(len(labels) / float(ncol)))
+            legend_h_in = max(1.1, 0.34 * legend_rows + 0.28)
+        else:
+            ncol = 1
+            legend_rows = 1
+            legend_h_in = 0.45
+
+        layout_key = tuple(item[0] for item in series_items)
+        cache = self._mpl_cache
+        if cache is None or cache.get('layout_key') != layout_key or cache.get('ncol') != ncol:
+            self._reset_mpl_cache()
+            fig = plt.figure(figsize=(fig_w_in, plot_h_in + legend_h_in), dpi=render_dpi)
+            gs = fig.add_gridspec(2, 1, height_ratios=[plot_h_in, legend_h_in], hspace=0.14)
+            plot_ax = fig.add_subplot(gs[0, 0])
+            legend_ax = fig.add_subplot(gs[1, 0])
+
+            ds_name = dataset_name if dataset_name else "N/A"
+            title_text = f"PSNR Curves on Dataset: {ds_name} (ref: {reference_key})"
+
+            plot_ax.set_ylabel("PSNR (dB)")
+            plot_ax.set_title(title_text, fontsize=14)
+            plot_ax.tick_params(axis='x', pad=6, labelsize=10)
+            plot_ax.tick_params(axis='y', labelsize=10)
+            plot_ax.grid(True, linestyle='--', linewidth=0.1, alpha=1.0)
+            legend_ax.axis('off')
+            legend_ax.set_xlim(0.0, 1.0)
+            legend_ax.set_ylim(0.0, 1.0)
+
+            line_artists = {}
+            legend_line_artists = {}
+            legend_text_artists = {}
+            for method_name, legend_name, _y_arr, color in series_items:
+                line_obj, = plot_ax.plot([], [], linewidth=0.5, color=color, alpha=1.0, antialiased=True)
+                line_artists[method_name] = line_obj
+
+                idx = len(legend_line_artists)
+                row = idx // ncol
+                col = idx % ncol
+                cell_w = 1.0 / float(ncol)
+                cell_h = 1.0 / float(max(1, legend_rows))
+                x0 = col * cell_w
+                y_top = 1.0 - row * cell_h
+                y_bottom = y_top - cell_h
+                y_mid = (y_top + y_bottom) * 0.5
+                l_obj, = legend_ax.plot(
+                    [x0 + 0.06 * cell_w, x0 + 0.25 * cell_w],
+                    [y_mid, y_mid],
+                    color=color,
+                    linewidth=1.0,
+                    alpha=1.0,
+                    solid_capstyle='round',
+                    transform=legend_ax.transAxes,
+                    clip_on=False,
+                )
+                txt_obj = legend_ax.text(
+                    x0 + 0.30 * cell_w,
+                    y_mid,
+                    legend_name,
+                    ha='left',
+                    va='center',
+                    fontsize=9,
+                    fontweight='normal',
+                    transform=legend_ax.transAxes,
+                    clip_on=False,
+                )
+                legend_line_artists[method_name] = l_obj
+                legend_text_artists[method_name] = txt_obj
+
+            fig.subplots_adjust(left=0.08, right=0.99, top=0.95, bottom=0.05, hspace=0.24)
+            self._mpl_cache = {
+                'fig': fig,
+                'plot_ax': plot_ax,
+                'legend_ax': legend_ax,
+                'line_artists': line_artists,
+                'legend_line_artists': legend_line_artists,
+                'legend_text_artists': legend_text_artists,
+                'layout_key': layout_key,
+                'ncol': ncol,
+                'legend_rows': max(1, legend_rows),
+                'title_text': title_text,
+            }
+            cache = self._mpl_cache
+
+        fig = cache['fig']
+        plot_ax = cache['plot_ax']
+        legend_ax = cache['legend_ax']
+        line_artists = cache['line_artists']
+        legend_line_artists = cache['legend_line_artists']
+        legend_text_artists = cache.get('legend_text_artists', {})
+        highlight_set = set(highlight_methods or [])
+        has_highlight = len(highlight_set) > 0
+
+        # ---- 3) Update dynamic plot content (data/highlight/title/ylim) ----
+        for method_name, _legend_name, y_arr, _color in series_items:
+            line_obj = line_artists.get(method_name)
+            if line_obj is None:
+                continue
+            is_hl = method_name in highlight_set
+            line_obj.set_data(x, y_arr)
+            line_obj.set_linewidth((2.0 if is_hl else 0.2) if has_highlight else 0.5)
+            line_obj.set_alpha(1.0 if (is_hl or not has_highlight) else 0.7)
+            line_obj.set_zorder(6 if is_hl else 2)
+
+            l_obj = legend_line_artists.get(method_name)
+            if l_obj is not None:
+                l_obj.set_linewidth(2.2 if is_hl else 1.0)
+
+            txt_obj = legend_text_artists.get(method_name)
+            if txt_obj is not None:
+                txt_obj.set_fontweight('bold' if is_hl else 'normal')
+
+        ds_name = dataset_name if dataset_name else "N/A"
+        title_text = f"PSNR Curves on Dataset: {ds_name} (ref: {reference_key})"
+        if cache.get('title_text') != title_text:
+            plot_ax.set_title(title_text, fontsize=14)
+            cache['title_text'] = title_text
+        plot_ax.set_xlim(1, max(2, int(n)))
+
+        if finite_values:
+            y_all = np.concatenate(finite_values)
+            y_min = float(np.min(y_all))
+            y_max = float(np.max(y_all))
+            if y_max <= y_min:
+                y_min -= 1.0
+                y_max += 1.0
+            pad = max(0.5, (y_max - y_min) * 0.08)
+            y_data_min = y_min - pad
+            y_data_max = y_max + pad
+            plot_ax.set_ylim(y_data_min, y_data_max)
+        else:
+            y_data_min = 0.0
+            y_data_max = 50.0
+            plot_ax.set_ylim(y_data_min, y_data_max)
+
+        # ---- 4) Rasterize and compute hitboxes + stable plot bounds ----
+        fig.canvas.draw()
+        w, h = fig.canvas.get_width_height()
+        renderer = fig.canvas.get_renderer()
+
+        # Use axis bbox and convert display(bottom-left origin) -> image(top-left origin).
+        bbox = plot_ax.get_window_extent(renderer=renderer)
+        x_min = int(round(min(bbox.x0, bbox.x1)))
+        x_max = int(round(max(bbox.x0, bbox.x1)))
+        y_top = int(round(h - max(bbox.y0, bbox.y1)))
+        y_bottom = int(round(h - min(bbox.y0, bbox.y1)))
+        line_meta = {
+            'n': int(n),
+            'x_min': x_min,
+            'x_max': x_max,
+            'y_min': y_top,
+            'y_max': y_bottom,
+            'y_data_min': float(y_data_min),
+            'y_data_max': float(y_data_max),
+        }
+
+        hitboxes = []
+        rows = max(1, int(cache.get('legend_rows', 1)))
+        cell_w = 1.0 / float(max(1, ncol))
+        cell_h = 1.0 / float(rows)
+        for i, (method_name, _legend_name, _y_arr, _color) in enumerate(series_items):
+            row = i // ncol
+            col = i % ncol
+            x0 = col * cell_w
+            y_top_ax = 1.0 - row * cell_h
+            y_bottom_ax = y_top_ax - cell_h
+            p1 = legend_ax.transAxes.transform((x0, y_bottom_ax))
+            p2 = legend_ax.transAxes.transform((x0 + cell_w, y_top_ax))
+            x1 = int(min(p1[0], p2[0]))
+            x2 = int(max(p1[0], p2[0]))
+            y1_disp = int(min(p1[1], p2[1]))
+            y2_disp = int(max(p1[1], p2[1]))
+            y1_inv = int(h - y2_disp)
+            y2_inv = int(h - y1_disp)
+            y_low = min(y1_inv, y2_inv, y1_disp, y2_disp)
+            y_high = max(y1_inv, y2_inv, y1_disp, y2_disp)
+            hitboxes.append({
+                'method': method_name,
+                'x1': x1,
+                'x2': x2,
+                'y1': y_low,
+                'y2': y_high,
+            })
+
+        rgba = np.asarray(fig.canvas.buffer_rgba())
+        rgb = np.ascontiguousarray(rgba[:, :, :3])
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        return bgr, hitboxes, line_meta
+
+    def _submit_render_request(self, request):
+        with self._render_lock:
+            if self._render_future is None:
+                fut = self._render_executor.submit(
+                    self._render_plot_image,
+                    request['ps'],
+                    request['pn'],
+                    request['pds'],
+                    request['pref'],
+                    request['frame_idx'],
+                    request['highlight'],
+                )
+                fut._psnr_request = request
+                self._render_future = fut
+            else:
+                self._render_staged_request = request
+
+    def _pump_render_worker(self):
+        with self._render_lock:
+            fut = self._render_future
+        if fut is None or not fut.done():
+            return
+
+        try:
+            image, hitboxes, line_meta = fut.result()
+        except Exception as e:
+            log.warn(f"PSNR render failed: {e}")
+            image, hitboxes, line_meta = None, [], None
+
+        with self._render_lock:
+            request = getattr(fut, '_psnr_request', None)
+            self._render_future = None
+            staged = self._render_staged_request
+            self._render_staged_request = None
+
+        if request is not None:
+            self._plot_image_base = image
+            self._plot_line_meta = line_meta
+            current_frame_idx = int(getattr(self.host, 'current_frame', 0))
+            self._plot_image = self._compose_plot_with_frame_line(current_frame_idx)
+            self._legend_hitboxes = hitboxes or []
+            self._dirty = False
+            self._last_render_frame_idx = current_frame_idx
+            self._last_render_highlight = set(request['highlight'] or [])
+
+        if staged is not None:
+            self._submit_render_request(staged)
+
+    def _request_render(self, ps, pn, pds, pref, frame_idx, highlight):
+        highlight_payload = tuple(sorted(set(highlight or [])))
+        self._render_seq += 1
+        request = {
+            'seq': self._render_seq,
+            'ps': ps,
+            'pn': pn,
+            'pds': pds,
+            'pref': pref,
+            'frame_idx': int(frame_idx),
+            'highlight': highlight_payload,
+        }
+        with self._render_lock:
+            if self._render_future is None:
+                fut = self._render_executor.submit(
+                    self._render_plot_image,
+                    request['ps'],
+                    request['pn'],
+                    request['pds'],
+                    request['pref'],
+                    request['frame_idx'],
+                    request['highlight'],
+                )
+                fut._psnr_request = request
+                self._render_future = fut
+            else:
+                self._render_staged_request = request
+
+    def _loading_canvas(self):
+        canvas = np.zeros((240, 640, 3), dtype=np.uint8)
+        cv2.putText(canvas, "PSNR is computing asynchronously...", (16, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 220, 255), 2, lineType=cv2.LINE_AA)
+        return canvas
+
+    def _cancel_pending(self):
+        try:
+            for fut in list(self._pending_futures.values()):
+                if fut is not None and not fut.done():
+                    fut.cancel()
+        except Exception:
+            pass
+        self._pending_futures = {}
+        with self._completion_signal_lock:
+            self._completed_signal_count = 0
+
+    def _start_async_compute(self):
+        self._cancel_pending()
+        token = self._build_cache_token()
+
+        image_files_snapshot = {
+            k: list(v) if isinstance(v, (list, tuple)) else []
+            for k, v in self.host.image_files.items()
+        }
+        ref_key_snapshot = self.host.reference_key
+        dataset_snapshot = self.host.dataset
+        ref_files = image_files_snapshot.get(ref_key_snapshot, [])
+        n = len(ref_files)
+        method_keys = [k for k in image_files_snapshot.keys() if k != ref_key_snapshot]
+
+        with self._lock:
+            self._values_dataset = dataset_snapshot
+            self._values_ref = ref_key_snapshot
+            self._values_n = n
+            self.values = {k: [np.nan] * n for k in method_keys}
+
+        self._pending_token = token
+        self._cache_token = token
+        self._dirty = False
+        self._last_refresh_ts = 0.0
+        self._completed_since_last_render = 0
+
+        self._pending_futures = {}
+        for mk in method_keys:
+            mk_files = image_files_snapshot.get(mk, [])
+            limit = min(len(ref_files), len(mk_files))
+            for idx in range(limit):
+                fut = self._executor.submit(
+                    self._compute_one_psnr_task,
+                    token,
+                    mk,
+                    idx,
+                    ref_files[idx],
+                    mk_files[idx],
+                )
+                fut.add_done_callback(self._on_future_done)
+                self._pending_futures[(mk, idx)] = fut
+
+    def _ensure_plot_image(self):
+        token = self._build_cache_token()
+        now_ts = time.time()
+        current_frame_idx = int(getattr(self.host, 'current_frame', 0))
+
+        self._pump_render_worker()
+
+        completed_count = 0
+        for task_key, fut in list(self._pending_futures.items()):
+            if not fut.done():
+                continue
+            try:
+                done_token, done_method, done_index, value = fut.result()
+                if done_token == self._build_cache_token():
+                    with self._lock:
+                        series = self.values.get(done_method)
+                        if series is not None and 0 <= done_index < len(series):
+                            series[done_index] = value
+                            completed_count += 1
+            except Exception as e:
+                log.warn(f"PSNR async compute failed for task {task_key}: {e}")
+                completed_count += 1
+
+        for task_key in [k for k, fut in self._pending_futures.items() if fut.done()]:
+            self._pending_futures.pop(task_key, None)
+
+        if (not self._pending_futures) and self._pending_token is not None:
+            if self._pending_token == self._build_cache_token():
+                self._cache_token = self._pending_token
+            self._pending_token = None
+
+        need_refresh = self._dirty or self._cache_token != token or self._plot_image is None
+        frame_changed = (current_frame_idx != self._last_render_frame_idx)
+        highlight_changed = (set(self._highlight_methods) != set(self._last_render_highlight))
+        if completed_count > 0:
+            self._completed_since_last_render += completed_count
+
+        data_changed = self._completed_since_last_render > 0
+        refresh_elapsed = (now_ts - self._last_refresh_ts) >= self._refresh_interval_sec
+        force_refresh = need_refresh or highlight_changed
+        should_refresh_plot = force_refresh or (data_changed and refresh_elapsed)
+
+        if should_refresh_plot:
+            with self._lock:
+                ps = {k: list(v) for k, v in self.values.items()}
+                pn = int(self._values_n)
+                pds = self._values_dataset
+                pref = self._values_ref
+            self._request_render(ps, pn, pds, pref, current_frame_idx, self._highlight_methods)
+            self._last_refresh_ts = now_ts
+
+            if self._completed_since_last_render > 0:
+                with self._completion_signal_lock:
+                    self._completed_signal_count = max(
+                        0,
+                        self._completed_signal_count - self._completed_since_last_render,
+                    )
+                self._completed_since_last_render = 0
+        elif frame_changed and self._plot_image_base is not None:
+            self._plot_image = self._compose_plot_with_frame_line(current_frame_idx)
+            self._last_render_frame_idx = current_frame_idx
+
+    def on_before_update_display(self, _host):
+        self._ensure_plot_image()
+
+    def on_after_update_display(self, _host):
+        self._ensure_plot_image()
+        if not self._psnr_mouse_bound:
+            cv2.namedWindow(self.window_psnr)
+            cv2.setMouseCallback(self.window_psnr, self._on_psnr_mouse)
+            self._psnr_mouse_bound = True
+        if self._plot_image is not None:
+            cv2.imshow(self.window_psnr, self._plot_image)
+        elif self._pending_futures:
+            cv2.imshow(self.window_psnr, self._loading_canvas())
+
+    def update(self):
+        should_update = False
+        with self._completion_signal_lock:
+            if self._completed_signal_count > 0:
+                should_update = True
+        with self._render_lock:
+            if self._render_future is not None and self._render_future.done():
+                should_update = True
+        if should_update:
+            self.host.request_update()
+
+    def on_rebuild_dataset(self, _host):
+        self._highlight_methods = set()
+        self._last_render_frame_idx = -1
+        self._last_render_highlight = set()
+        self._psnr_jump_armed = False
+        self._reset_mpl_cache()
+        self._start_async_compute()
+
+    def on_shutdown(self, _host):
+        self._cancel_pending()
+        with self._render_lock:
+            if self._render_future is not None and not self._render_future.done():
+                self._render_future.cancel()
+            self._render_future = None
+            self._render_staged_request = None
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        try:
+            self._render_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        self._psnr_jump_armed = False
+        self._reset_mpl_cache()
+        self._psnr_mouse_bound = False
+
+
+def install_default_psnr_feature(host):
+    return AsyncPsnrFeature(host, refresh_interval_sec=0.5, max_workers=16)
+
+
 class InteractiveCropComparator:
     def __init__(
             self,
@@ -356,6 +1318,7 @@ class InteractiveCropComparator:
             current_group=None,
             current_dataset=None,
             method_roots=None,
+                event_on_init=None,
     ):
         self.input_folders = input_folders
         self.output_folder = output_folder
@@ -374,6 +1337,8 @@ class InteractiveCropComparator:
                 self.display_scale = 1.0
         except Exception:
             self.display_scale = 1.0
+        self.display_scale_min = 0.25
+        self.display_scale_max = 8.0
 
         if not os.path.exists(self.output_folder):
             os.makedirs(self.output_folder, exist_ok=True)
@@ -414,6 +1379,7 @@ class InteractiveCropComparator:
         self.window_main = "Crop Controller"
         self.window_grid = "Crop Grid"
         self.window_final = "Final Layout"
+        self.window_psnr = "PSNR Curves"
 
         self.dragging = False
         self.mode = 'idle'  # 'selection' | 'position' | 'idle'
@@ -508,6 +1474,8 @@ class InteractiveCropComparator:
         self._drag_button = None
         self._mb_down_roi_id = None
         self._mb_down_point = None
+        # Optional event hooks for branch features (e.g. PSNR plugin)
+        self._event_handlers = {}
         # dataset/group tracking
         self.group = current_group
         self.dataset = current_dataset
@@ -570,6 +1538,29 @@ class InteractiveCropComparator:
         print(f"Inferred dataset: {log.style_key(self.dataset)}, group: {log.style_key(self.group)} from input paths.")
 
         self._refresh_method_grid_sorting()
+        if callable(event_on_init):
+            try:
+                feature_obj = event_on_init(self)
+                if callable(getattr(feature_obj, 'update', None)):
+                    self.register_event_handler(
+                        'loop_tick',
+                        lambda _host, _feature=feature_obj: _feature.update(),
+                    )
+            except Exception as e:
+                log.warn(f"event_on_init execution failed: {e}")
+
+    def register_event_handler(self, event_name, handler):
+        if not event_name or not callable(handler):
+            return
+        self._event_handlers.setdefault(str(event_name), []).append(handler)
+
+    def _emit_event(self, event_name):
+        handlers = self._event_handlers.get(str(event_name), [])
+        for h in handlers:
+            try:
+                h(self)
+            except Exception as e:
+                log.warn(f"Event handler failed for {event_name}: {e}")
 
     def _infer_method_root(self, src, files):
         """Best-effort method root inference for rebuild_dataset support."""
@@ -647,6 +1638,18 @@ class InteractiveCropComparator:
         self.layout_mode = mode
         self.request_update()
 
+    def _adjust_display_scale(self, step_count):
+        if step_count == 0:
+            return
+        old_scale = float(self.display_scale)
+        new_scale = old_scale + 0.1 * int(step_count)
+        new_scale = max(self.display_scale_min, min(self.display_scale_max, new_scale))
+        new_scale = round(new_scale, 1)
+        if abs(new_scale - old_scale) > 1e-9:
+            self.display_scale = new_scale
+            log.note(f"Display scale: {self.display_scale:.2f}")
+            self.request_update()
+
     # ---- Key binding setup ----
     def _register_keybindings(self):
         self.dispatcher.register(ord('n'), self._cmd_next_frame)
@@ -658,6 +1661,10 @@ class InteractiveCropComparator:
         self.dispatcher.register(ord('z'), self._cmd_undo)
         self.dispatcher.register(ord('y'), self._cmd_redo)
         self.dispatcher.register(ord('d'), self._cmd_duplicate_roi)
+        self.dispatcher.register(ord('='), lambda: self._adjust_display_scale(1))
+        self.dispatcher.register(ord('+'), lambda: self._adjust_display_scale(1))
+        self.dispatcher.register(ord('-'), lambda: self._adjust_display_scale(-1))
+        self.dispatcher.register(ord('_'), lambda: self._adjust_display_scale(-1))
         # digits 1-9
         for d in range(1, 10):
             self.dispatcher.register(ord(str(d)), lambda rid=d: self._cmd_digit_roi(rid))
@@ -965,6 +1972,7 @@ class InteractiveCropComparator:
                 pass
         self.grid_windows = set()
         self.add_roi()
+        self._emit_event('on_rebuild_dataset')
         self._refresh_method_grid_sorting()
         if new_group:
             log.success(f"Switched to {log.style_path(new_group)}/{log.style_path(new_dataset)}")
@@ -1257,6 +2265,19 @@ class InteractiveCropComparator:
         return (sx, sy, sx + sx_sign * side, sy + sy_sign * side)
 
     def on_mouse(self, event, x, y, flags, param):
+        if event == cv2.EVENT_MOUSEWHEEL:
+            try:
+                delta = int(cv2.getMouseWheelDelta(flags))
+            except Exception:
+                delta = (int(flags) >> 16) & 0xFFFF
+                if delta >= 0x8000:
+                    delta -= 0x10000
+
+            if delta != 0:
+                steps = int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
+                self._adjust_display_scale(steps)
+            return
+
         if event == cv2.EVENT_RBUTTONDOWN or event == cv2.EVENT_RBUTTONDBLCLK:
             rois_here = self._rois_at_point(x, y)
             target = None
@@ -1951,6 +2972,7 @@ class InteractiveCropComparator:
             return out
 
     def update_display(self):
+        self._emit_event('before_update_display')
         ref = self.read_frame(self.reference_key, self.current_frame)
         if ref is None:
             return
@@ -2041,6 +3063,7 @@ class InteractiveCropComparator:
                 if final_view is not None and final_view.ndim == 3 and final_view.shape[2] == 4:
                     final_view = cv2.cvtColor(final_view, cv2.COLOR_BGRA2BGR)
                 cv2.imshow(self.window_final, final_view)
+        self._emit_event('after_update_display')
         self.needs_update = False
 
     def _serialize_rois(self):
@@ -2278,53 +3301,74 @@ class InteractiveCropComparator:
             self.add_roi()
         self.request_update()
 
+        def _normalize_key(raw_key):
+            if raw_key in (2490368, 2621440, 2424832, 2555904):  # ↑ ↓ ← →
+                arrow_map = {2424832: 81, 2490368: 82, 2555904: 83, 2621440: 84}
+                return arrow_map[raw_key]
+            return raw_key & 0xFF if raw_key >= 0 else raw_key
+
         while True:
+            keys = []
+            first_key = cv2.waitKeyEx(10)
+            if first_key >= 0:
+                keys.append(_normalize_key(first_key))
+                # Drain queued key events so all commands execute before one render.
+                for _ in range(64):
+                    k = cv2.waitKeyEx(1)
+                    if k < 0:
+                        break
+                    keys.append(_normalize_key(k))
+
+            should_quit = False
+            for key in keys:
+                handled = self.dispatcher.dispatch(key)
+                if handled:
+                    continue
+                if key == ord('q') or key == 27:
+                    should_quit = True
+                    break
+                elif key in [13, 10]:
+                    # Enter: prompt to switch dataset (optionally group/dataset)
+                    try:
+                        prompt = "Enter dataset (or group/dataset): "
+                        text = input(prompt).strip()
+                    except Exception:
+                        text = ""
+                    if text:
+                        if '/' in text:
+                            ng, nd = text.split('/', -1)
+                        else:
+                            ng, nd = None, text
+
+                        if not nd:
+                            log.error("Dataset is empty; aborted switch")
+                        else:
+                            if self.rebuild_dataset(nd, ng):
+                                self.request_update()
+                    else:
+                        log.info("Dataset switch cancelled (empty input)")
+                elif key == 32:
+                    # Space: prompt to jump to image by name
+                    try:
+                        text = input("Enter image name to jump (stem or filename): ").strip()
+                    except Exception:
+                        text = ""
+                    if text:
+                        if self.jump_to_image_by_name(text):
+                            self.request_update()
+                    else:
+                        log.info("Image jump cancelled (empty input)")
+
+            if should_quit:
+                break
+
+            # Events/plot refresh are processed after key batch, so image commands take priority.
+            self._emit_event('loop_tick')
             if self.needs_update:
                 self.update_display()
-            key = cv2.waitKeyEx(10)
-            if key in (2490368, 2621440, 2424832, 2555904):  # ↑ ↓ ← →
-                arrow_map = {2424832: 81, 2490368: 82, 2555904: 83, 2621440: 84}
-                key = arrow_map[key]
-            else:
-                key = key & 0xFF if key >= 0 else key
-            handled = self.dispatcher.dispatch(key)
-            if handled:
-                continue
-            if key == ord('q') or key == 27:
-                break
-            elif key in [13, 10]:
-                # Enter: prompt to switch dataset (optionally group/dataset)
-                try:
-                    prompt = "Enter dataset (or group/dataset): "
-                    text = input(prompt).strip()
-                except Exception:
-                    text = ""
-                if text:
-                    if '/' in text:
-                        ng, nd = text.split('/', -1)
-                    else:
-                        ng, nd = None, text
 
-                    if not nd:
-                        log.error("Dataset is empty; aborted switch")
-                    else:
-                        if self.rebuild_dataset(nd, ng):
-                            self.request_update()
-                else:
-                    log.info("Dataset switch cancelled (empty input)")
-            elif key == 32:
-                # Space: prompt to jump to image by name
-                try:
-                    text = input("Enter image name to jump (stem or filename): ").strip()
-                except Exception:
-                    text = ""
-                if text:
-                    if self.jump_to_image_by_name(text):
-                        self.request_update()
-                else:
-                    log.info("Image jump cancelled (empty input)")
-
-    cv2.destroyAllWindows()
+        self._emit_event('on_shutdown')
+        cv2.destroyAllWindows()
 
 
 def _parse_exclude_methods(raw):
@@ -2584,6 +3628,7 @@ if __name__ == "__main__":
         compose_layout=args.compose_layout,
         current_group=args.group,
         current_dataset=dataset,
+        event_on_init=install_default_psnr_feature,
     )
     comparator.mode = args.mode
     comparator.layout_mode = args.layout
