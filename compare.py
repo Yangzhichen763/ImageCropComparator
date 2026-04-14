@@ -217,6 +217,68 @@ def has_images(directory, exts=None):
         return False
 
 
+def has_images_direct(directory, exts=None):
+    """Check whether a directory contains image files directly (non-recursive)."""
+    exts = exts or IMG_EXTS
+    if not directory or not os.path.isdir(directory):
+        return False
+    ext_set = {str(e).lower().lstrip('.') for e in exts}
+    try:
+        for name in os.listdir(directory):
+            if name.startswith('.'):
+                continue
+            path = os.path.join(directory, name)
+            if not os.path.isfile(path):
+                continue
+            ext = os.path.splitext(name)[1].lstrip('.').lower()
+            if ext in ext_set:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def discover_first_dataset_path(method_root, exts=None):
+    """Find the first dataset-like folder with direct image files.
+
+    Search order:
+      1) <method>/<dataset>
+      2) <method>/<group>/<dataset>
+    """
+    exts = exts or IMG_EXTS
+    if not method_root or not os.path.isdir(method_root):
+        return None
+
+    try:
+        level1_dirs = [
+            d for d in sorted(os.listdir(method_root))
+            if (not d.startswith('.')) and os.path.isdir(os.path.join(method_root, d))
+        ]
+    except Exception:
+        return None
+
+    for d1 in level1_dirs:
+        p1 = os.path.join(method_root, d1)
+        if has_images_direct(p1, exts=exts):
+            return p1
+
+    for d1 in level1_dirs:
+        p1 = os.path.join(method_root, d1)
+        try:
+            level2_dirs = [
+                d for d in sorted(os.listdir(p1))
+                if (not d.startswith('.')) and os.path.isdir(os.path.join(p1, d))
+            ]
+        except Exception:
+            continue
+        for d2 in level2_dirs:
+            p2 = os.path.join(p1, d2)
+            if has_images_direct(p2, exts=exts):
+                return p2
+
+    return None
+
+
 def resolve_group_folder(method_root, target_group):
     """Resolve a group folder allowing hyphen/underscore mismatch."""
     tg = (target_group or '').replace('-', '').replace('_', '')
@@ -267,6 +329,10 @@ def discover_method_path(method_root, group=None, dataset=None, pair=None, struc
             candidates.append(os.path.join(method_root, group_name, dataset))
         if dataset:
             candidates.append(os.path.join(method_root, dataset))
+        if not group and not dataset and not pair:
+            auto_dataset = discover_first_dataset_path(method_root)
+            if auto_dataset:
+                candidates.append(auto_dataset)
         candidates.append(method_root)
 
     for cand in candidates:
@@ -1490,18 +1556,31 @@ class InteractiveCropComparator:
             try:
                 dir_parts_list = []
                 for _, src in self.input_folders.items():
-                    if isinstance(src, str) and src:
-                        norm = os.path.normpath(src)
-                        parts = [p for p in norm.split(os.sep) if p and p != '.']
-                        if parts:
-                            dir_parts_list.append(parts)
-                    elif isinstance(src, (list, tuple)) and len(src) > 0:
+                    if isinstance(src, (list, tuple)) and len(src) > 0:
                         first_path = src[0]
                         if isinstance(first_path, str) and first_path:
                             norm_dir = os.path.normpath(os.path.dirname(first_path))
                             parts = [p for p in norm_dir.split(os.sep) if p and p != '.']
                             if parts:
                                 dir_parts_list.append(parts)
+                        continue
+
+                    if isinstance(src, str) and src:
+                        # Prefer real image directories (already discovered from input_folders)
+                        # so dataset/group inference does not collapse to method roots like "examples/A-Net".
+                        files = self.image_files.get(_, [])
+                        first_file = files[0] if isinstance(files, list) and len(files) > 0 else None
+                        if isinstance(first_file, str) and first_file:
+                            norm_dir = os.path.normpath(os.path.dirname(first_file))
+                            parts = [p for p in norm_dir.split(os.sep) if p and p != '.']
+                            if parts:
+                                dir_parts_list.append(parts)
+                                continue
+
+                        norm = os.path.normpath(src)
+                        parts = [p for p in norm.split(os.sep) if p and p != '.']
+                        if parts:
+                            dir_parts_list.append(parts)
 
                 inferred_dataset = None
                 inferred_group = None
@@ -1654,6 +1733,8 @@ class InteractiveCropComparator:
     def _register_keybindings(self):
         self.dispatcher.register(ord('n'), self._cmd_next_frame)
         self.dispatcher.register(ord('p'), self._cmd_prev_frame)
+        self.dispatcher.register(ord(']'), self._cmd_next_frame)
+        self.dispatcher.register(ord('['), self._cmd_prev_frame)
         self.dispatcher.register(ord('a'), self._cmd_add_roi)
         self.dispatcher.register(ord('i'), self._cmd_idle_mode)
         self.dispatcher.register(ord('r'), self._cmd_clear_rois)
@@ -2080,11 +2161,11 @@ class InteractiveCropComparator:
             self._method_srt_stems[k] = stem
 
         if all_have:
-            log.info(f"Using .srt-based sorting for grid display of methods: "
+            log.info(f"Using `.srt`-based sorting for grid display of methods: "
                      f"{', '.join(f'{log.style_path(k)}->{v}' for k, v in self._method_srt_stems.items())}")
         else:
             missing = [k for k in methods if k not in self._method_srt_stems]
-            log.warn(f"Not all methods have .srt files. Methods missing .srt files: {', '.join(log.style_path(k) for k in missing)}")
+            log.warn(f"Not all methods have `.srt` files. Methods missing `.srt` files: {', '.join(log.style_path(k) for k in missing)}")
         self._all_methods_have_srt = bool(all_have and len(self._method_srt_stems) == len(methods))
 
     def _ordered_method_keys_for_grid(self):
@@ -2478,7 +2559,7 @@ class InteractiveCropComparator:
             scale_for_text = float(self.display_scale) if float(self.display_scale) > 0 else 1.0
         except Exception:
             scale_for_text = 1.0
-        text_scale = 0.35 / scale_for_text
+        text_scale = 0.8 / scale_for_text
         text_thickness = max(1, int(round(1 / scale_for_text)))
         text_y = max(12, int(round(12 / scale_for_text)))
 
@@ -3286,7 +3367,10 @@ class InteractiveCropComparator:
         )
         log.info(
             "Other: "
-            + f"{log.style_key('n')}/{log.style_key('p')} next/prev image, "
+            + f"{log.style_key('[')}/{log.style_key('p')} prev image, "
+            + f"{log.style_key(']')}/{log.style_key('n')} next image, "
+            + f"{log.style_key('+')}/{log.style_key('=')} zoom in, "
+            + f"{log.style_key('-')}/{log.style_key('_')} zoom out, "
             + f"{log.style_key('s')} save outputs, "
             + f"{log.style_key('i')} idle toggle, "
             + f"{log.style_key('r')} clear all rois, "
@@ -3294,7 +3378,7 @@ class InteractiveCropComparator:
             + f"{log.style_key('y')} redo, "
             + f"{log.style_key('Enter')} switch dataset/group, "
             + f"{log.style_key('Space')} jump to image, "
-            + f"{log.style_key('q')} quit"
+            + f"{log.style_key('q')}/{log.style_key('Esc')} quit"
         )
         # Default: enter ROI 1 selection mode at startup
         if len(self.rois) == 0:
@@ -3399,7 +3483,7 @@ if __name__ == "__main__":
     )
     g_data.add_argument('--source', choices=['local', 'external'], default='local', type=str,
                         help='Data source: local uses the workspace structure under --root; external uses /data/user paths with --pair videos.')
-    g_data.add_argument('--root', '-r', default=r'E:\Documents\master\projects\BASICTransform - backups\visio Figs\imgs\Results\SDSD-indoor', type=str,
+    g_data.add_argument('--root', '-r', default=r'./examples/', type=str,
                         help='Workspace root containing method folders (local mode only). Example: /mnt/user/results/LLIE-results')
     g_data.add_argument('--output', '-o', default='./crop_grids/', type=str,
                         help='Root output folder. Files are saved under output/<timestamp>/<dataset>/...')
@@ -3559,7 +3643,7 @@ if __name__ == "__main__":
             pass
 
         if not methods:
-            raise ValueError("No methods found under root; please specify methods.txt or add method folders.")
+            raise ValueError(f"No methods found under root {args.root}; please specify methods.txt or add method folders.")
 
         methods, removed = _apply_exclude(methods, exclude_methods)
         if removed:
@@ -3645,12 +3729,35 @@ if __name__ == "__main__":
     try:
         shared_layout = any(isinstance(v, (list, tuple)) for v in input_folder.values())
         structure_used = 'shared' if shared_layout else args.structure
+        has_pair = bool(str(pair).strip()) if pair is not None else False
+        per_method_counts = {
+            k: len(v) if isinstance(v, (list, tuple)) else 0
+            for k, v in comparator.image_files.items()
+        }
+        counts = list(per_method_counts.values())
+        if has_pair and counts and len(set(counts)) == 1:
+            count_info = f"frames per method={log.style_num(str(counts[0]))}"
+        elif has_pair and counts:
+            count_info = (
+                f"frames per method range="
+                f"{log.style_num(str(min(counts)))}~{log.style_num(str(max(counts)))}"
+            )
+        else:
+            details = ', '.join(
+                f"{log.style_path(k)}:{log.style_num(str(v))}"
+                for k, v in sorted(per_method_counts.items())
+            ) if per_method_counts else 'N/A'
+            count_info = f"images per method on dataset={details}"
+
         log.info(
             f"Loaded {log.style_num(str(len(comparator.image_files)))} methods "
             f"using structure={log.style_mode(structure_used)}; "
             f"reference={log.style_key(comparator.reference_key)}; "
-            f"frames per method≈{log.style_num(str(comparator.num_frames))}"
+            f"{count_info}"
         )
+        if has_pair and counts and len(set(counts)) > 1:
+            details = ', '.join(f"{k}:{v}" for k, v in sorted(per_method_counts.items()))
+            log.warn(f"Frame counts differ across methods: {details}")
         if shared_layout:
             log.note("Detected shared layout (image-id folders containing per-method files)")
     except Exception:
