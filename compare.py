@@ -14,8 +14,12 @@ import numpy as np
 
 try:
     from matplotlib import pyplot as plt
+    from matplotlib.ticker import MaxNLocator, FormatStrFormatter, AutoMinorLocator
 except Exception:  # pragma: no cover - optional dependency
     plt = None
+    MaxNLocator = None
+    FormatStrFormatter = None
+    AutoMinorLocator = None
 
 from typing import Union, Tuple
 
@@ -25,6 +29,7 @@ except Exception:  # pragma: no cover - optional dependency
     _natsorted = sorted
 
 IMG_EXTS = ['png', 'jpg', 'jpeg', 'bmp', 'ppm']
+INPUT_IDLE_UPDATE_SEC = 0.4
 
 
 def is_hidden_path(path):
@@ -876,16 +881,14 @@ class AsyncPsnrFeature:
             if not self._warned:
                 log.warn("matplotlib is not available; PSNR curve window is disabled")
                 self._warned = True
-            return None
-        if n <= 0 or not psnr_series:
-            return None
+            return self._loading_canvas(), [], None
 
         # ---- 1) Figure/canvas baseline configuration ----
         # Render on a larger physical canvas first to avoid tiny-font collapse.
         fig_w_in = 20.0
         plot_h_in = 6.0
         render_dpi = 80
-        x = np.arange(1, n + 1)
+        x = np.arange(1, max(0, int(n)) + 1)
         # ---- 2) Prepare per-method series metadata (values, color, legend label) ----
         cmap = plt.get_cmap('tab20')
         other_idx = 0
@@ -940,6 +943,17 @@ class AsyncPsnrFeature:
             plot_ax.tick_params(axis='x', pad=6, labelsize=10)
             plot_ax.tick_params(axis='y', labelsize=10)
             plot_ax.grid(True, linestyle='--', linewidth=0.1, alpha=1.0)
+            empty_text = plot_ax.text(
+                0.5,
+                0.5,
+                "Waiting for PSNR values...",
+                ha='center',
+                va='center',
+                fontsize=12,
+                color=(0.35, 0.35, 0.35),
+                transform=plot_ax.transAxes,
+                visible=False,
+            )
             legend_ax.axis('off')
             legend_ax.set_xlim(0.0, 1.0)
             legend_ax.set_ylim(0.0, 1.0)
@@ -996,6 +1010,7 @@ class AsyncPsnrFeature:
                 'ncol': ncol,
                 'legend_rows': max(1, legend_rows),
                 'title_text': title_text,
+                'empty_text': empty_text,
             }
             cache = self._mpl_cache
 
@@ -1049,6 +1064,35 @@ class AsyncPsnrFeature:
             y_data_min = 0.0
             y_data_max = 50.0
             plot_ax.set_ylim(y_data_min, y_data_max)
+
+        empty_text = cache.get('empty_text')
+        if empty_text is not None:
+            has_any_values = bool(finite_values)
+            empty_text.set_visible(not has_any_values)
+
+        # Make tick density adapt to plot resolution (larger plot -> denser ticks).
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        bbox = plot_ax.get_window_extent(renderer=renderer)
+        axis_w_px = max(1.0, float(abs(bbox.x1 - bbox.x0)))
+        axis_h_px = max(1.0, float(abs(bbox.y1 - bbox.y0)))
+
+        if MaxNLocator is not None and FormatStrFormatter is not None:
+            x_bins = max(3, min(24, int(round(axis_w_px / 90.0))))
+            if int(n) > 0:
+                x_bins = min(x_bins, max(2, int(n)))
+            y_bins = max(3, min(16, int(round(axis_h_px / 60.0))))
+
+            plot_ax.xaxis.set_major_locator(MaxNLocator(nbins=x_bins, integer=True, min_n_ticks=2))
+            plot_ax.xaxis.set_major_formatter(FormatStrFormatter('%d'))
+            plot_ax.yaxis.set_major_locator(MaxNLocator(nbins=y_bins, min_n_ticks=3))
+
+            if AutoMinorLocator is not None:
+                x_minor = max(2, min(6, int(round(axis_w_px / 240.0))))
+                y_minor = max(2, min(6, int(round(axis_h_px / 180.0))))
+                plot_ax.xaxis.set_minor_locator(AutoMinorLocator(x_minor))
+                plot_ax.yaxis.set_minor_locator(AutoMinorLocator(y_minor))
+                plot_ax.grid(True, which='minor', linestyle=':', linewidth=0.08, alpha=0.6)
 
         # ---- 4) Rasterize and compute hitboxes + stable plot bounds ----
         fig.canvas.draw()
@@ -1182,7 +1226,7 @@ class AsyncPsnrFeature:
 
     def _loading_canvas(self):
         canvas = np.zeros((240, 640, 3), dtype=np.uint8)
-        cv2.putText(canvas, "PSNR is computing asynchronously...", (16, 120),
+        cv2.putText(canvas, "Generating PSNR Panel...", (16, 120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 220, 255), 2, lineType=cv2.LINE_AA)
         return canvas
 
@@ -1219,9 +1263,20 @@ class AsyncPsnrFeature:
 
         self._pending_token = token
         self._cache_token = token
-        self._dirty = False
+        self._dirty = True
         self._last_refresh_ts = 0.0
         self._completed_since_last_render = 0
+        self._plot_image = None
+        self._plot_image_base = None
+        self._plot_line_meta = None
+        self._legend_hitboxes = []
+
+        with self._lock:
+            ps = {k: list(v) for k, v in self.values.items()}
+            pn = int(self._values_n)
+            pds = self._values_dataset
+            pref = self._values_ref
+        self._request_render(ps, pn, pds, pref, int(self.host.current_frame), self._highlight_methods)
 
         self._pending_futures = {}
         for mk in method_keys:
@@ -1277,9 +1332,8 @@ class AsyncPsnrFeature:
             self._completed_since_last_render += completed_count
 
         data_changed = self._completed_since_last_render > 0
-        refresh_elapsed = (now_ts - self._last_refresh_ts) >= self._refresh_interval_sec
         force_refresh = need_refresh or highlight_changed
-        should_refresh_plot = force_refresh or (data_changed and refresh_elapsed)
+        should_refresh_plot = force_refresh or data_changed
 
         if should_refresh_plot:
             with self._lock:
@@ -1310,9 +1364,11 @@ class AsyncPsnrFeature:
             cv2.namedWindow(self.window_psnr)
             cv2.setMouseCallback(self.window_psnr, self._on_psnr_mouse)
             self._psnr_mouse_bound = True
+        with self._render_lock:
+            has_render_job = self._render_future is not None
         if self._plot_image is not None:
             cv2.imshow(self.window_psnr, self._plot_image)
-        elif self._pending_futures:
+        elif self._pending_futures or has_render_job:
             cv2.imshow(self.window_psnr, self._loading_canvas())
 
     def update(self):
@@ -1543,6 +1599,15 @@ class InteractiveCropComparator:
         self._drag_button = None
         self._mb_down_roi_id = None
         self._mb_down_point = None
+        self._last_input_activity_ts = 0.0
+        self._layout_debounce_sec = float(INPUT_IDLE_UPDATE_SEC)
+        self._cached_layout_signature = None
+        self._cached_grid_views = {}
+        self._cached_final_view = None
+        self._cached_ref_frame = None
+        self._cached_ref_frame_key = None
+        self._cached_ref_frame_idx = -1
+        self._cached_ref_frame_path = None
         # Optional event hooks for branch features (e.g. PSNR plugin)
         self._event_handlers = {}
         # dataset/group tracking
@@ -1941,6 +2006,28 @@ class InteractiveCropComparator:
         """Mark UI as dirty; main loop will repaint."""
         self.needs_update = True
 
+    def _layout_state_signature(self):
+        rois_sig = []
+        for rid, r in sorted(self.rois.items()):
+            rect = r.get('rect')
+            if rect is None:
+                rois_sig.append((rid, None))
+            else:
+                x1, y1, x2, y2 = self.clamp_rect(rect)
+                rois_sig.append((rid, int(x1), int(y1), int(x2), int(y2)))
+
+        return (
+            str(self.mode),
+            int(self.current_frame),
+            str(self.preview_key),
+            str(self.layout_mode),
+            str(self.sort_mode),
+            bool(self.sort_reverse),
+            float(self.display_scale),
+            float(self.preview_mask_alpha),
+            tuple(rois_sig),
+        )
+
     def _color_with_alpha(self, color):
         """Return a color matching the current canvas channel count."""
         if self.layout_use_alpha:
@@ -2073,6 +2160,10 @@ class InteractiveCropComparator:
         self.dataset = new_dataset
         self.image_files = {name: filter_hidden(glob_single_files(path, ['png', 'jpg', 'jpeg'])) for name, path in
                             new_inputs.items()}
+        self._cached_ref_frame = None
+        self._cached_ref_frame_key = None
+        self._cached_ref_frame_idx = -1
+        self._cached_ref_frame_path = None
 
         # pick reference key
         keys = list(self.image_files.keys())
@@ -2405,6 +2496,19 @@ class InteractiveCropComparator:
         return (sx, sy, sx + sx_sign * side, sy + sy_sign * side)
 
     def on_mouse(self, event, x, y, flags, param):
+        if event in (
+                cv2.EVENT_MOUSEMOVE,
+                cv2.EVENT_LBUTTONDOWN,
+                cv2.EVENT_LBUTTONUP,
+                cv2.EVENT_RBUTTONDOWN,
+                cv2.EVENT_RBUTTONUP,
+                cv2.EVENT_RBUTTONDBLCLK,
+                cv2.EVENT_MBUTTONDOWN,
+                cv2.EVENT_MBUTTONUP,
+                cv2.EVENT_MOUSEWHEEL,
+        ):
+            self._last_input_activity_ts = time.time()
+
         if event == cv2.EVENT_MOUSEWHEEL:
             try:
                 delta = int(cv2.getMouseWheelDelta(flags))
@@ -2577,7 +2681,27 @@ class InteractiveCropComparator:
         files = self.image_files[key]
         if idx < 0 or idx >= len(files):
             idx = max(0, min(len(files) - 1, idx))
-        img = read_images_as_numpy(files[idx])
+        path = files[idx]
+
+        # Reuse the reference frame when key/frame/path are unchanged.
+        if key == self.reference_key:
+            if (
+                    self._cached_ref_frame is not None
+                    and self._cached_ref_frame_key == key
+                    and self._cached_ref_frame_idx == idx
+                    and self._cached_ref_frame_path == path
+            ):
+                return self._cached_ref_frame
+
+            img = read_images_as_numpy(path)
+        
+            self._cached_ref_frame = img
+            self._cached_ref_frame_key = key
+            self._cached_ref_frame_idx = idx
+            self._cached_ref_frame_path = path
+        else:
+            img = read_images_as_numpy(path)
+        
         return img
 
     def build_grid_for_rect(self, rect, roi_color=None):
@@ -3151,10 +3275,15 @@ class InteractiveCropComparator:
             return out
 
     def update_display(self):
-        self._emit_event('before_update_display')
         ref = self.read_frame(self.reference_key, self.current_frame)
         if ref is None:
             return
+        now_ts = time.time()
+        layout_idle = (now_ts - float(self._last_input_activity_ts)) >= float(self._layout_debounce_sec)
+        allow_secondary_update = (self.mode == 'idle') or layout_idle
+        if allow_secondary_update:
+            self._emit_event('before_update_display')
+        
         canvas = ref.copy()
         overlay = canvas.copy()
         overlay_applied = False
@@ -3201,74 +3330,99 @@ class InteractiveCropComparator:
                 except Exception:
                     pass
             self.grid_windows.clear()
+            self._cached_grid_views = {}
+            self._cached_final_view = None
+            self._cached_layout_signature = None
 
             # Final layout window (preview)
             blank = final_layout_blank()
             cv2.imshow(self.window_final, blank)
         else:
-            needed = set()
-            valid_rois = [(rid, r) for rid, r in sorted(self.rois.items()) if r['rect'] is not None]
-            for rid, r in valid_rois:
-                name = f"{self.window_grid} ROI {rid}"
-                grid = self.build_grid_for_rect(r['rect'], roi_color=r.get('color'))  # , header_text=f"ROI {rid}")
-                if grid is None:
-                    continue
-                if self.display_scale and self.display_scale != 1.0:
-                    grid_view = cv2.resize(grid, dsize=None, fx=self.display_scale, fy=self.display_scale,
-                                           interpolation=cv2.INTER_NEAREST)
-                    cv2.imshow(name, grid_view)
-                else:
-                    cv2.imshow(name, grid)
-                needed.add(name)
-            # Destroy windows no longer needed
-            obsolete = self.grid_windows - needed
-            for w in obsolete:
-                try:
-                    cv2.destroyWindow(w)
-                except Exception:
-                    pass
-            self.grid_windows = needed
+            if allow_secondary_update:
+                layout_sig = self._layout_state_signature()
+                layout_changed = (layout_sig != self._cached_layout_signature)
+                should_rebuild_layout = (self._cached_layout_signature is None) or layout_changed
 
-            # Final layout window (preview only shows one image)
-            preview_key = self.preview_key or self.reference_key
-            final = self.build_final_layout_for_key(preview_key, sort_mode=self.sort_mode,
-                                                    reverse_sort=self.sort_reverse)
-            if final is None:
-                blank = final_layout_blank()
-                cv2.imshow(self.window_final, blank)
-            else:
-                # Final preview image size is not affected by scale
-                final_view = final
-                if final_view is not None and final_view.ndim == 3 and final_view.shape[2] == 4:
-                    final_view = cv2.cvtColor(final_view, cv2.COLOR_BGRA2BGR)
-                cv2.imshow(self.window_final, final_view)
+                if should_rebuild_layout:
+                    rebuilt_grids = {}
+                    valid_rois = [(rid, r) for rid, r in sorted(self.rois.items()) if r['rect'] is not None]
+                    for rid, r in valid_rois:
+                        name = f"{self.window_grid} ROI {rid}"
+                        grid = self.build_grid_for_rect(r['rect'], roi_color=r.get('color'))
+                        if grid is None:
+                            continue
+                        if self.display_scale and self.display_scale != 1.0:
+                            grid = cv2.resize(
+                                grid,
+                                dsize=None,
+                                fx=self.display_scale,
+                                fy=self.display_scale,
+                                interpolation=cv2.INTER_NEAREST,
+                            )
+                        rebuilt_grids[name] = grid
+
+                    preview_key = self.preview_key or self.reference_key
+                    final = self.build_final_layout_for_key(
+                        preview_key,
+                        sort_mode=self.sort_mode,
+                        reverse_sort=self.sort_reverse,
+                    )
+                    if final is not None and final.ndim == 3 and final.shape[2] == 4:
+                        final = cv2.cvtColor(final, cv2.COLOR_BGRA2BGR)
+
+                    self._cached_grid_views = rebuilt_grids
+                    self._cached_final_view = final
+                    self._cached_layout_signature = layout_sig
+
+                needed = set(self._cached_grid_views.keys())
+                for name, grid_view in self._cached_grid_views.items():
+                    cv2.imshow(name, grid_view)
+
+                # Destroy windows no longer needed
+                obsolete = self.grid_windows - needed
+                for w in obsolete:
+                    try:
+                        cv2.destroyWindow(w)
+                    except Exception:
+                        pass
+                self.grid_windows = needed
+
+                if self._cached_final_view is None:
+                    blank = final_layout_blank()
+                    cv2.imshow(self.window_final, blank)
+                else:
+                    cv2.imshow(self.window_final, self._cached_final_view)
 
         if self.show_all_method_images:
-            full_grid = self.build_full_image_grid()
-            if full_grid is None:
-                blank = final_layout_blank()
-                cv2.imshow(self.method_full_image_window, blank)
-            else:
-                display_scale = float(self.full_image_scale or 0.5)
-                if display_scale <= 0:
-                    display_scale = 0.5
-                if display_scale != 1.0:
-                    full_grid = cv2.resize(
-                        full_grid,
-                        dsize=None,
-                        fx=display_scale,
-                        fy=display_scale,
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                if full_grid.ndim == 3 and full_grid.shape[2] == 4:
-                    full_grid = cv2.cvtColor(full_grid, cv2.COLOR_BGRA2BGR)
-                cv2.imshow(self.method_full_image_window, full_grid)
+            if allow_secondary_update:
+                full_grid = self.build_full_image_grid()
+                if full_grid is None:
+                    blank = final_layout_blank()
+                    cv2.imshow(self.method_full_image_window, blank)
+                else:
+                    display_scale = float(self.full_image_scale or 0.5)
+                    if display_scale <= 0:
+                        display_scale = 0.5
+                    if display_scale != 1.0:
+                        full_grid = cv2.resize(
+                            full_grid,
+                            dsize=None,
+                            fx=display_scale,
+                            fy=display_scale,
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    if full_grid.ndim == 3 and full_grid.shape[2] == 4:
+                        full_grid = cv2.cvtColor(full_grid, cv2.COLOR_BGRA2BGR)
+                    cv2.imshow(self.method_full_image_window, full_grid)
         else:
             try:
                 cv2.destroyWindow(self.method_full_image_window)
             except Exception:
                 pass
-        self._emit_event('after_update_display')
+        
+        if allow_secondary_update:
+            self._emit_event('after_update_display')
+
         self.needs_update = False
 
     def _serialize_rois(self):
@@ -3516,6 +3670,8 @@ class InteractiveCropComparator:
                 return arrow_map[raw_key]
             return raw_key & 0xFF if raw_key >= 0 else raw_key
 
+        exit_keys = {ord('q'), 27}
+
         while True:
             keys = []
             first_key = cv2.waitKeyEx(10)
@@ -3528,15 +3684,27 @@ class InteractiveCropComparator:
                         break
                     keys.append(_normalize_key(k))
 
-            should_quit = False
+            if any(k in exit_keys for k in keys):
+                break
+
+            if keys:
+                self._last_input_activity_ts = time.time()
+
+            if self.mode != 'idle':
+                now_ts = time.time()
+                layout_idle = (now_ts - float(self._last_input_activity_ts)) >= float(self._layout_debounce_sec)
+                if layout_idle:
+                    try:
+                        if self._cached_layout_signature != self._layout_state_signature():
+                            self.request_update()
+                    except Exception:
+                        pass
+
             for key in keys:
                 handled = self.dispatcher.dispatch(key)
                 if handled:
                     continue
-                if key == ord('q') or key == 27:
-                    should_quit = True
-                    break
-                elif key in [13, 10]:
+                if key in [13, 10]:
                     # Enter: prompt to switch dataset (optionally group/dataset)
                     try:
                         prompt = "Enter dataset (or group/dataset): "
@@ -3567,9 +3735,6 @@ class InteractiveCropComparator:
                             self.request_update()
                     else:
                         log.info("Image jump cancelled (empty input)")
-
-            if should_quit:
-                break
 
             # Events/plot refresh are processed after key batch, so image commands take priority.
             self._emit_event('loop_tick')
