@@ -550,7 +550,7 @@ class AsyncPsnrFeature:
         return max(0, min(n - 1, idx))
 
     def _current_marker_x_px(self):
-        frame_idx = int(getattr(self.host, 'current_frame', 0))
+        frame_idx = int(self.host.current_frame)
         meta = self._plot_line_meta or {}
         n = int(meta.get('n', 0))
         if n <= 0:
@@ -573,18 +573,11 @@ class AsyncPsnrFeature:
         if idx < 0:
             idx = 0
 
-        num_frames = int(getattr(self.host, 'num_frames', 0) or 0)
+        num_frames = int(self.host.num_frames or 0)
         if num_frames > 0:
             idx = min(num_frames - 1, idx)
 
-        set_frame_fn = getattr(self.host, '_set_frame', None)
-        if callable(set_frame_fn):
-            set_frame_fn(idx)
-        else:
-            self.host.current_frame = idx
-            req_fn = getattr(self.host, 'request_update', None)
-            if callable(req_fn):
-                req_fn()
+        self.host._set_frame(idx)
 
         try:
             ref_files = self.host.image_files.get(self.host.reference_key, [])
@@ -1141,7 +1134,7 @@ class AsyncPsnrFeature:
             image, hitboxes, line_meta = None, [], None
 
         with self._render_lock:
-            request = getattr(fut, '_psnr_request', None)
+            request = fut._psnr_request
             self._render_future = None
             staged = self._render_staged_request
             self._render_staged_request = None
@@ -1149,7 +1142,7 @@ class AsyncPsnrFeature:
         if request is not None:
             self._plot_image_base = image
             self._plot_line_meta = line_meta
-            current_frame_idx = int(getattr(self.host, 'current_frame', 0))
+            current_frame_idx = int(self.host.current_frame)
             self._plot_image = self._compose_plot_with_frame_line(current_frame_idx)
             self._legend_hitboxes = hitboxes or []
             self._dirty = False
@@ -1249,7 +1242,7 @@ class AsyncPsnrFeature:
     def _ensure_plot_image(self):
         token = self._build_cache_token()
         now_ts = time.time()
-        current_frame_idx = int(getattr(self.host, 'current_frame', 0))
+        current_frame_idx = int(self.host.current_frame)
 
         self._pump_render_worker()
 
@@ -1374,6 +1367,7 @@ class InteractiveCropComparator:
             columns=None,
             grid_gap=2,
             display_scale=1.0,
+            full_image_scale=0.5,
             line_thickness=5,
             layout_border_scale=2.0,
             layout_gap=10,
@@ -1405,6 +1399,12 @@ class InteractiveCropComparator:
             self.display_scale = 1.0
         self.display_scale_min = 0.25
         self.display_scale_max = 8.0
+        try:
+            self.full_image_scale = float(full_image_scale)
+            if self.full_image_scale <= 0:
+                self.full_image_scale = 0.5
+        except Exception:
+            self.full_image_scale = 0.5
 
         if not os.path.exists(self.output_folder):
             os.makedirs(self.output_folder, exist_ok=True)
@@ -1455,8 +1455,8 @@ class InteractiveCropComparator:
 
         self.palette = [
             (0, 0, 255),  # red
-            (0, 255, 0),  # green
             (255, 0, 0),  # blue
+            (0, 255, 0),  # green
             (0, 255, 255),  # yellow
             (255, 0, 255),  # magenta
             (255, 255, 0),  # cyan
@@ -1520,11 +1520,14 @@ class InteractiveCropComparator:
 
         self.cached_images = None
         self.grid_windows = set()
+        self.method_full_image_window = "Method Full Images"
         self.layout_mode = 'right'  # 'left' | 'top' | 'right' | 'bottom'
         self.sort_mode = 'position'  # 'position' | 'id'
         self.sort_reverse = False
         self.preview_key = reference_key
+        self.single_crop_position = 'auto'
         self.compose_layout = bool(compose_layout)
+        self.show_all_method_images = False
         self.save_session_ts = None
         self.undo_manager = UndoManager()
         self.dispatcher = EventDispatcher()
@@ -1620,7 +1623,7 @@ class InteractiveCropComparator:
         if callable(event_on_init):
             try:
                 feature_obj = event_on_init(self)
-                if callable(getattr(feature_obj, 'update', None)):
+                if hasattr(feature_obj, 'update') and callable(feature_obj.update):
                     self.register_event_handler(
                         'loop_tick',
                         lambda _host, _feature=feature_obj: _feature.update(),
@@ -1735,6 +1738,7 @@ class InteractiveCropComparator:
         self.dispatcher.register(ord('p'), self._cmd_prev_frame)
         self.dispatcher.register(ord(']'), self._cmd_next_frame)
         self.dispatcher.register(ord('['), self._cmd_prev_frame)
+        self.dispatcher.register(9, self._cmd_toggle_all_method_images)
         self.dispatcher.register(ord('a'), self._cmd_add_roi)
         self.dispatcher.register(ord('i'), self._cmd_idle_mode)
         self.dispatcher.register(ord('r'), self._cmd_clear_rois)
@@ -1908,6 +1912,14 @@ class InteractiveCropComparator:
             log.info(f"Redid: {desc or 'last action'}")
             self.request_update()
 
+    def _cmd_toggle_all_method_images(self):
+        self.show_all_method_images = not self.show_all_method_images
+        if not self.show_all_method_images:
+            log.note("Hidden full images for all methods")
+        else:
+            log.note("Showing full images for all methods")
+        self.request_update()
+
     # ---- Small helpers ----
     def _set_mode(self, mode):
         self.mode = mode
@@ -1953,6 +1965,53 @@ class InteractiveCropComparator:
         if self.layout_use_alpha:
             return np.full((height, width, 4), self.layout_bg_color, dtype=np.uint8)
         return np.full((height, width, 3), self.layout_bg_color, dtype=np.uint8)
+
+    def _resolve_method_keys(self):
+        keys = self._ordered_method_keys_for_grid()
+        if len(keys) == 0:
+            keys = list(self.image_files.keys())
+        return keys
+
+    def _new_grid_canvas(self, height, width):
+        """Create RGB(+alpha) buffers for grid composition with layout background."""
+        if self.layout_use_alpha:
+            if len(self.layout_bg_color) >= 4:
+                bg = self.layout_bg_color
+            else:
+                bg = (
+                    self.layout_bg_color[0] if len(self.layout_bg_color) >= 1 else 0,
+                    self.layout_bg_color[1] if len(self.layout_bg_color) >= 2 else 0,
+                    self.layout_bg_color[2] if len(self.layout_bg_color) >= 3 else 0,
+                    0,
+                )
+            grid_rgb = np.full((height, width, 3), bg[:3], dtype=np.uint8)
+            grid_alpha = np.full((height, width), bg[3], dtype=np.uint8)
+            return grid_rgb, grid_alpha, bg
+
+        bg = self.layout_bg_color[:3] if len(self.layout_bg_color) >= 3 else (0, 0, 0)
+        grid_rgb = np.full((height, width, 3), bg, dtype=np.uint8)
+        return grid_rgb, None, bg
+
+    def _finalize_grid_canvas(self, grid_rgb, grid_alpha):
+        if self.layout_use_alpha and grid_alpha is not None:
+            return np.dstack([grid_rgb, grid_alpha])
+        return grid_rgb
+
+    @staticmethod
+    def _grid_text_style(display_scale, scale_divisor=1.0):
+        try:
+            scale_for_text = float(display_scale)
+            if scale_divisor > 0:
+                scale_for_text = scale_for_text / float(scale_divisor)
+            if scale_for_text <= 0:
+                scale_for_text = 1.0
+        except Exception:
+            scale_for_text = 1.0
+        safe_scale = max(scale_for_text, 0.01)
+        text_scale = 0.5 / safe_scale
+        text_thickness = max(1, int(round(1 / safe_scale)))
+        text_y = max(15, int(round(15 / safe_scale)))
+        return text_scale, text_thickness, text_y
 
     def _darken_color(self, color, steps):
         if steps <= 0:
@@ -2526,26 +2585,14 @@ class InteractiveCropComparator:
         roi_w = max(1, x2 - x1)
         roi_h = max(1, y2 - y1)
 
-        # method_keys = [k for k in self.image_files.keys() if k not in ['GT', 'input']]
-        method_keys = self._ordered_method_keys_for_grid()
-        if len(method_keys) == 0:
-            method_keys = list(self.image_files.keys())
+        method_keys = self._resolve_method_keys()
 
         cols = self.columns
         rows = max(1, math.ceil(len(method_keys) / cols))
         gap = self.grid_gap
         grid_h = rows * roi_h + gap * (rows - 1)
         grid_w = cols * roi_w + gap * (cols - 1)
-        
-        # Use layout_bg_color for grid background, support RGBA if transparent
-        if self.layout_use_alpha:
-            bg_color = self.layout_bg_color if len(self.layout_bg_color) >= 4 else (self.layout_bg_color[0] if len(self.layout_bg_color) >= 1 else 0, self.layout_bg_color[1] if len(self.layout_bg_color) >= 2 else 0, self.layout_bg_color[2] if len(self.layout_bg_color) >= 3 else 0, 0)
-            grid_rgb = np.full((grid_h, grid_w, 3), bg_color[:3], dtype=np.uint8)
-            grid_alpha = np.full((grid_h, grid_w), bg_color[3] if len(bg_color) >= 4 else 0, dtype=np.uint8)
-        else:
-            bg_color = self.layout_bg_color[:3] if len(self.layout_bg_color) >= 3 else (0, 0, 0)
-            grid_rgb = np.full((grid_h, grid_w, 3), bg_color, dtype=np.uint8)
-            grid_alpha = None
+        grid_rgb, grid_alpha, bg_color = self._new_grid_canvas(grid_h, grid_w)
 
         # Use ROI color for labels (match the ROI selection box color)
         label_color = (0, 255, 0)
@@ -2555,13 +2602,7 @@ class InteractiveCropComparator:
         except Exception:
             label_color = (0, 255, 0)
         # Keep text size visually stable when grid window is magnified.
-        try:
-            scale_for_text = float(self.display_scale) if float(self.display_scale) > 0 else 1.0
-        except Exception:
-            scale_for_text = 1.0
-        text_scale = 0.8 / scale_for_text
-        text_thickness = max(1, int(round(1 / scale_for_text)))
-        text_y = max(12, int(round(12 / scale_for_text)))
+        text_scale, text_thickness, text_y = self._grid_text_style(self.display_scale)
 
         for i, name in enumerate(method_keys):
             img = self.read_frame(name, self.current_frame)
@@ -2628,13 +2669,7 @@ class InteractiveCropComparator:
                 lineType=cv2.LINE_AA,
             )
         
-        # Combine RGB and alpha if needed
-        if self.layout_use_alpha and grid_alpha is not None:
-            grid = np.dstack([grid_rgb, grid_alpha])
-        else:
-            grid = grid_rgb
-        
-        return grid
+        return self._finalize_grid_canvas(grid_rgb, grid_alpha)
 
     def build_grid(self):
         valid_rois = [(rid, r) for rid, r in sorted(self.rois.items()) if r['rect'] is not None]
@@ -2681,6 +2716,69 @@ class InteractiveCropComparator:
                 y += gap
         return out
 
+    def build_full_image_grid(self):
+        method_keys = self._resolve_method_keys()
+        if len(method_keys) == 0:
+            return None
+
+        images = []
+        labels = []
+        max_h = 0
+        max_w = 0
+        for name in method_keys:
+            img = self.read_frame(name, self.current_frame)
+            if img is None:
+                continue
+            if img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            elif img.ndim == 3 and img.shape[2] > 3:
+                img = img[:, :, :3]
+            images.append(img)
+            labels.append(str(name))
+            max_h = max(max_h, img.shape[0])
+            max_w = max(max_w, img.shape[1])
+
+        if len(images) == 0:
+            return None
+
+        cols = self.columns
+        rows = max(1, math.ceil(len(images) / cols))
+        gap = self.grid_gap
+        grid_h = rows * max_h + gap * (rows - 1)
+        grid_w = cols * max_w + gap * (cols - 1)
+
+        grid_rgb, grid_alpha, _bg_color = self._new_grid_canvas(grid_h, grid_w)
+
+        base_text_scale, base_text_thickness, base_text_y = self._grid_text_style(1.0)
+        full_scale = max(0.01, self.full_image_scale)
+        text_scale = base_text_scale * full_scale
+        text_thickness = max(1, int(round(base_text_thickness * full_scale)))
+        text_y = max(8, int(round(base_text_y * full_scale)))
+        label_color = (0, 255, 0)
+
+        for i, img in enumerate(images):
+            row = i // cols
+            col = i % cols
+            y0 = row * max_h + row * gap
+            x0 = col * max_w + col * gap
+            h, w = img.shape[:2]
+            grid_rgb[y0:y0 + h, x0:x0 + w] = img
+            if self.layout_use_alpha and grid_alpha is not None:
+                grid_alpha[y0:y0 + h, x0:x0 + w] = 255
+
+            cv2.putText(
+                grid_rgb,
+                labels[i],
+                (x0 + 2, y0 + text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                text_scale,
+                label_color,
+                text_thickness,
+                lineType=cv2.LINE_AA,
+            )
+
+        return self._finalize_grid_canvas(grid_rgb, grid_alpha)
+
     def build_final_layout_for_key(self, key, sort_mode=None, reverse_sort=False):
         ref = self.read_frame(key, self.current_frame)
         if ref is None:
@@ -2688,7 +2786,7 @@ class InteractiveCropComparator:
         ref = self._to_canvas_image(ref)
         H, W = ref.shape[:2]
         valid = [(rid, r) for rid, r in sorted(self.rois.items()) if r['rect'] is not None]
-        if not getattr(self, 'compose_layout', True):
+        if not self.compose_layout:
             if len(valid) == 0:
                 return ref.copy()
             out = ref.copy()
@@ -2770,7 +2868,7 @@ class InteractiveCropComparator:
                 dy = ay - by
                 return dx * dx + dy * dy
 
-            pos = _norm_single_pos(getattr(self, 'single_crop_position', 'auto'))
+            pos = _norm_single_pos(self.single_crop_position)
             if pos == 'tl':
                 x0, y0 = 0, 0
             elif pos == 'tr':
@@ -3144,6 +3242,32 @@ class InteractiveCropComparator:
                 if final_view is not None and final_view.ndim == 3 and final_view.shape[2] == 4:
                     final_view = cv2.cvtColor(final_view, cv2.COLOR_BGRA2BGR)
                 cv2.imshow(self.window_final, final_view)
+
+        if self.show_all_method_images:
+            full_grid = self.build_full_image_grid()
+            if full_grid is None:
+                blank = final_layout_blank()
+                cv2.imshow(self.method_full_image_window, blank)
+            else:
+                display_scale = float(self.full_image_scale or 0.5)
+                if display_scale <= 0:
+                    display_scale = 0.5
+                if display_scale != 1.0:
+                    full_grid = cv2.resize(
+                        full_grid,
+                        dsize=None,
+                        fx=display_scale,
+                        fy=display_scale,
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                if full_grid.ndim == 3 and full_grid.shape[2] == 4:
+                    full_grid = cv2.cvtColor(full_grid, cv2.COLOR_BGRA2BGR)
+                cv2.imshow(self.method_full_image_window, full_grid)
+        else:
+            try:
+                cv2.destroyWindow(self.method_full_image_window)
+            except Exception:
+                pass
         self._emit_event('after_update_display')
         self.needs_update = False
 
@@ -3369,6 +3493,7 @@ class InteractiveCropComparator:
             "Other: "
             + f"{log.style_key('[')}/{log.style_key('p')} prev image, "
             + f"{log.style_key(']')}/{log.style_key('n')} next image, "
+            + f"{log.style_key('Tab')} show/hide all method full-image grid, "
             + f"{log.style_key('+')}/{log.style_key('=')} zoom in, "
             + f"{log.style_key('-')}/{log.style_key('_')} zoom out, "
             + f"{log.style_key('s')} save outputs, "
@@ -3524,6 +3649,8 @@ if __name__ == "__main__":
                         help='Gap (in pixels) between tiles in per-ROI method grid windows (default: 2).')
     g_view.add_argument('--magnify', '--scale', default=2, type=float,
                         help='Display-only magnification for crop grid windows. Final preview is not globally scaled; multi-ROI ignores this.')
+    g_view.add_argument('--full-image-scale', default=0.3, type=float,
+                        help='Display scale for the Tab full-image grid window (default: 0.3).')
 
     # --- Final layout preview ---
     g_layout = parser.add_argument_group(
@@ -3705,6 +3832,7 @@ if __name__ == "__main__":
         columns=args.columns,
         grid_gap=args.grid_gap,
         display_scale=args.magnify,
+        full_image_scale=args.full_image_scale,
         line_thickness=args.thickness,
         layout_border_scale=args.layout_border_scale,
         layout_gap=args.layout_gap,
@@ -3742,6 +3870,8 @@ if __name__ == "__main__":
                 f"frames per method range="
                 f"{log.style_num(str(min(counts)))}~{log.style_num(str(max(counts)))}"
             )
+        elif counts and len(set(counts)) == 1:
+            count_info = f"images per method on dataset={log.style_num(str(counts[0]))}"
         else:
             details = ', '.join(
                 f"{log.style_path(k)}:{log.style_num(str(v))}"
