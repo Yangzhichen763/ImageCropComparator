@@ -3,6 +3,8 @@ import concurrent.futures
 import math
 import os
 import sys
+import traceback
+
 import threading
 import time
 import warnings
@@ -11,6 +13,19 @@ from glob import glob
 
 import cv2
 import numpy as np
+try:
+    import torch
+except Exception:  # pragma: no cover - optional dependency
+    torch = None
+
+try:
+    from utils.metrics.pyiqa_metrics import IQAs as _IQAs
+    from utils.metrics.pyiqa_metrics import compute_iqa_metrics_multi_thread as _compute_iqa_metrics_multi_thread
+except Exception:  # pragma: no cover - optional dependency
+    print(f"Warning: IQAs not available, metric computations will be disabled")
+    traceback.print_exc()
+    _IQAs = None
+    _compute_iqa_metrics_multi_thread = None
 
 try:
     from matplotlib import pyplot as plt
@@ -416,13 +431,22 @@ def discover_local_inputs(root, methods, group=None, dataset=None, pair=None, st
     return {}
 
 
-class AsyncPsnrFeature:
-    """Optional PSNR feature module, attached through event_on_init."""
+class AsyncMetricFeature:
+    """Optional metric feature module, attached through event_on_init."""
 
-    def __init__(self, host, refresh_interval_sec=0.5, max_workers=4):
+    def __init__(self, host, refresh_interval_sec=0.5, max_workers=4, metric_type='psnr', threads_per_methods=16,
+                 metric_runner=None, metric_result_cache=None):
         self.host = host
-        self.window_psnr = "PSNR Curves"
+        # TODO: 支持任意指标的拓展接口，使用 register 编写接口以及 args 选择自定义的指标计算
+        self.metric_type = str(metric_type or 'psnr').strip()
+        self.metric_key = self.metric_type.split(' ')[0]
+        metric_upper = self.metric_key.upper()
+        self.window_psnr = f"Metric Curves ({metric_upper})"
         self.host.window_psnr = self.window_psnr
+        self.metric_display_name = metric_upper
+        self._threads_per_methods = max(1, int(threads_per_methods))
+        self._shared_metric_runner = metric_runner
+        self._metric_result_cache = metric_result_cache
 
         self._plot_image = None
         self._plot_image_base = None
@@ -431,10 +455,11 @@ class AsyncPsnrFeature:
         self._dirty = True
         self._warned = False
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        self._max_workers = max_workers
         self._render_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._pending_futures = {}
         self._pending_token = None
-        self._lock = threading.Lock()
+        self._cancel_event = threading.Event()
         self.values = {}
         self._values_n = 0
         self._values_dataset = None
@@ -447,14 +472,16 @@ class AsyncPsnrFeature:
         self._last_render_frame_idx = -1
         self._last_render_highlight = set()
         self._psnr_jump_armed = False
-        self._completion_signal_lock = threading.Lock()
         self._completed_signal_count = 0
-        self._render_lock = threading.Lock()
         self._render_future = None
         self._render_staged_request = None
         self._render_seq = 0
         self._completed_since_last_render = 0
         self._mpl_cache = None
+        self._metric_runner = None
+        self._enqueue_thread = None
+        self._planned_tasks = None
+        self._init_metric_runner()
 
         # Rendering is done in a worker thread on purpose; suppress this noisy warning.
         warnings.filterwarnings(
@@ -490,7 +517,7 @@ class AsyncPsnrFeature:
                 self._psnr_jump_armed = True
                 self._dirty = True
                 self.host.request_update()
-                log.note("PSNR jump armed: click target x on plot to jump frame")
+                log.note(f"{self.metric_display_name} jump armed: click target x on plot to jump frame")
                 return
 
         if self._psnr_jump_armed and (not self._point_in_plot_area(x, y)):
@@ -754,15 +781,14 @@ class AsyncPsnrFeature:
 
         best_method = None
         best_dist = float('inf')
-        with self._lock:
-            for method_name, series in self.values.items():
-                y_px = interp_y_at_index(series, idx_f)
-                if y_px is None:
-                    continue
-                dist = abs(int(y) - y_px)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_method = method_name
+        for method_name, series in self.values.items():
+            y_px = interp_y_at_index(series, idx_f)
+            if y_px is None:
+                continue
+            dist = abs(int(y) - y_px)
+            if dist < best_dist:
+                best_dist = dist
+                best_method = method_name
 
         # Keep picking strict to avoid accidental highlight when clicking empty region.
         if best_method is None or best_dist > 16:
@@ -774,8 +800,9 @@ class AsyncPsnrFeature:
                              for k, v in self.host.image_files.items()))
         return (self.host.dataset, self.host.reference_key, items)
 
+    #region ==[Computing]==
     @staticmethod
-    def _normalize_for_psnr(img):
+    def _normalize_for_metric(img):
         if img is None:
             return None
         if img.ndim == 2:
@@ -788,29 +815,237 @@ class AsyncPsnrFeature:
             img = np.clip(img, 0, 255).astype(np.uint8)
         return img
 
-    @staticmethod
-    def _compute_one_psnr(ref_path, cmp_path):
+    def _init_metric_runner(self):
+        if self._shared_metric_runner is not None:
+            self._metric_runner = self._shared_metric_runner
+            return
+        if _IQAs is None or _compute_iqa_metrics_multi_thread is None:
+            log.warn(f"Metric runner not available for '{self.metric_type}': missing dependency")
+            return
+        try:
+            # Use the project-level metric utility for arbitrary metrics.
+            # Auto-detect CUDA availability and use GPU if present
+            device = 'cuda' if torch is not None and torch.cuda.is_available() else 'cpu'
+            if device == 'cuda':
+                log.info(f"Metric runner using GPU (CUDA) for '{self.metric_type}'")
+            self._metric_runner = _IQAs(
+                self.metric_type,
+                n_threads_per_metric=self._threads_per_methods,
+                device=device,
+                traditional=True,
+            )
+        except Exception as e:
+            log.warn(f"Metric runner init failed for '{self.metric_type}': {e}")
+            traceback.print_exc()
+            self._metric_runner = None
+
+    def _compute_one_metric(self, ref_path, cmp_path):
+        cache_key = (ref_path, cmp_path)
+        if self._metric_result_cache is not None:
+            cached_metrics = self._metric_result_cache.get(cache_key)
+            if cached_metrics is not None and self.metric_type in cached_metrics:
+                return cached_metrics.get(self.metric_type, np.nan)
+
         ref_img = read_images_as_numpy(ref_path)
         cmp_img = read_images_as_numpy(cmp_path)
-        ref_img = AsyncPsnrFeature._normalize_for_psnr(ref_img)
-        cmp_img = AsyncPsnrFeature._normalize_for_psnr(cmp_img)
+        ref_img = AsyncMetricFeature._normalize_for_metric(ref_img)
+        cmp_img = AsyncMetricFeature._normalize_for_metric(cmp_img)
         if ref_img is None or cmp_img is None:
             return np.nan
         if cmp_img.shape[:2] != ref_img.shape[:2]:
             cmp_img = cv2.resize(cmp_img, (ref_img.shape[1], ref_img.shape[0]), interpolation=cv2.INTER_LINEAR)
-        return float(cv2.PSNR(cmp_img, ref_img))
+        if self._metric_runner is None:
+            # print(f"Warning: metric runner not available; cannot compute {self.metric_display_name}")
+            if self.metric_key.lower() == 'psnr':
+                return float(cv2.PSNR(cmp_img, ref_img))
+            return np.nan
 
-    def _compute_one_psnr_task(self, token, method_key, index, ref_path, cmp_path):
+        if torch is None:
+            return np.nan
+
+        pred_rgb = cv2.cvtColor(cmp_img, cv2.COLOR_BGR2RGB)
+        gt_rgb = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
+        pred_t = torch.from_numpy(pred_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        gt_t = torch.from_numpy(gt_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        metrics = self._metric_runner(pred_t, gt_t)
+        if self._metric_result_cache is not None:
+            self._metric_result_cache[cache_key] = dict(metrics)
+        value = metrics.get(self.metric_type)
+        if value is None:
+            value = metrics.get(self.metric_key)
+        if value is None:
+            return np.nan
+        if hasattr(value, 'item'):
+            return float(value.item())
+        return float(value)
+
+    def _compute_frame_task(self, token, method_key, ref_path, cmp_path, index):
+        """Compute one metric value for a single frame.
+
+        This finer-grained task improves parallelism both across methods and
+        within the same method when many frames are present.
+        """
+        if self._cancel_event.is_set() or token != self._build_cache_token():
+            return token, method_key, index, False
+
         try:
-            value = self._compute_one_psnr(ref_path, cmp_path)
-            return token, method_key, index, value
+            value = self._compute_one_metric(ref_path, cmp_path)
         except Exception:
-            return token, method_key, index, np.nan
+            value = np.nan
+
+        series = self.values.get(method_key)
+        if series is not None and 0 <= index < len(series):
+            series[index] = value
+
+        self._signal_progress(1)
+        return token, method_key, index, True
+
+    def _signal_progress(self, count=1):
+        if count <= 0:
+            return
+        self._completed_signal_count += int(count)
 
     def _on_future_done(self, _fut):
-        with self._completion_signal_lock:
-            self._completed_signal_count += 1
+        self._completed_signal_count += 1
 
+    @staticmethod
+    def _binary_index_order(n):
+        """Return indices in binary-split order: mid, left-half, right-half."""
+        n = int(n or 0)
+        if n <= 0:
+            return []
+        order = []
+        stack = [(0, n - 1)]
+        while stack:
+            left, right = stack.pop()
+            if left > right:
+                continue
+            mid = (left + right) // 2
+            order.append(mid)
+            # Push right first so left half is processed first (LIFO stack).
+            if mid + 1 <= right:
+                stack.append((mid + 1, right))
+            if left <= mid - 1:
+                stack.append((left, mid - 1))
+        return order
+
+    def _enqueue_metric_tasks(self, token, image_files_snapshot, ref_files, method_keys, method_limits, max_limit):
+        planned = []
+        for idx in self._binary_index_order(max_limit):
+            if self._cancel_event.is_set() or token != self._pending_token:
+                return
+            for mk in method_keys:
+                if self._cancel_event.is_set() or token != self._pending_token:
+                    return
+                limit = method_limits.get(mk, 0)
+                if idx >= limit:
+                    continue
+                mk_files = image_files_snapshot.get(mk, [])
+                planned.append((mk, ref_files[idx], mk_files[idx], idx))
+        if self._cancel_event.is_set() or token != self._pending_token:
+            return
+        self._planned_tasks = planned
+
+    def _submit_planned_metric_tasks(self):
+        if self._enqueue_thread is not None and self._enqueue_thread.is_alive():
+            return
+        if not self._planned_tasks:
+            return
+        tasks = self._planned_tasks
+        self._planned_tasks = None
+        token = self._pending_token
+        if token is None or self._cancel_event.is_set():
+            return
+        for mk, ref_path, cmp_path, idx in tasks:
+            if self._cancel_event.is_set() or token != self._pending_token:
+                return
+            fut = self._executor.submit(
+                self._compute_frame_task,
+                token,
+                mk,
+                ref_path,
+                cmp_path,
+                idx,
+            )
+            self._pending_futures[(mk, idx)] = fut
+
+    def _start_async_compute(self):
+        self._cancel_pending()
+        self._cancel_event = threading.Event()
+        token = self._build_cache_token()
+
+        image_files_snapshot = {
+            k: list(v) if isinstance(v, (list, tuple)) else []
+            for k, v in self.host.image_files.items()
+        }
+        ref_key_snapshot = self.host.reference_key
+        dataset_snapshot = self.host.dataset
+        ref_files = image_files_snapshot.get(ref_key_snapshot, [])
+        n = len(ref_files)
+        method_keys = [k for k in image_files_snapshot.keys() if k != ref_key_snapshot]
+
+        # Build per-method effective image counts.
+        method_limits = {
+            mk: min(len(ref_files), len(image_files_snapshot.get(mk, [])))
+            for mk in method_keys
+        }
+
+        # Auto-detect worker count using total image tasks, not only method count.
+        import multiprocessing
+        cpu_count = multiprocessing.cpu_count()
+        total_methods = len(method_keys)
+        total_tasks = sum(method_limits.values())
+        desired_workers = min(max(1, total_methods * self._threads_per_methods), self._max_workers, max(1, total_tasks), cpu_count)
+        log.info(f"Desired workers for {self.metric_display_name}: {desired_workers} (methods: {total_methods}, tasks: {total_tasks}, CPU cores: {cpu_count})")
+
+        current_workers = int(getattr(self._executor, '_max_workers', 0) or 0)
+        if current_workers != desired_workers:
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=desired_workers,
+                thread_name_prefix="MetricWorker"
+            )
+
+        self._values_dataset = dataset_snapshot
+        self._values_ref = ref_key_snapshot
+        self._values_n = n
+        self.values = {k: [np.nan] * n for k in method_keys}
+
+        self._pending_token = token
+        self._cache_token = token
+        self._dirty = True
+        self._last_refresh_ts = 0.0
+        self._completed_since_last_render = 0
+        self._plot_image = None
+        self._plot_image_base = None
+        self._plot_line_meta = None
+        self._legend_hitboxes = []
+
+        ps = {k: list(v) for k, v in self.values.items()}
+        pn = int(self._values_n)
+        pds = self._values_dataset
+        pref = self._values_ref
+        self._request_render(ps, pn, pds, pref, int(self.host.current_frame), self._highlight_methods)
+
+        # Submit one task per frame in round-robin across methods.
+        # This avoids queueing all frames of one method first, which can look
+        # like single-method processing in FIFO thread pools.
+        self._pending_futures = {}
+        self._planned_tasks = None
+        max_limit = max(method_limits.values(), default=0)
+        self._enqueue_thread = threading.Thread(
+            target=self._enqueue_metric_tasks,
+            args=(token, image_files_snapshot, ref_files, method_keys, method_limits, max_limit),
+            name="MetricEnqueueWorker",
+            daemon=True,
+        )
+        self._enqueue_thread.start()
+    #endregion
+
+    #region ==[Render]==
     @staticmethod
     def _draw_vertical_dashed_line(img, x, y1, y2, color, thickness=1, dash_len=6, gap_len=6):
         if img is None:
@@ -879,7 +1114,7 @@ class AsyncPsnrFeature:
         # ---- 0) Guard clauses: rendering backend and data availability ----
         if plt is None:
             if not self._warned:
-                log.warn("matplotlib is not available; PSNR curve window is disabled")
+                log.warn(f"matplotlib is not available; {self.metric_display_name} curve window is disabled")
                 self._warned = True
             return self._loading_canvas(), [], None
 
@@ -936,9 +1171,9 @@ class AsyncPsnrFeature:
             legend_ax = fig.add_subplot(gs[1, 0])
 
             ds_name = dataset_name if dataset_name else "N/A"
-            title_text = f"PSNR Curves on Dataset: {ds_name} (ref: {reference_key})"
+            title_text = f"{self.metric_display_name} Curves on Dataset: {ds_name} (ref: {reference_key})"
 
-            plot_ax.set_ylabel("PSNR (dB)")
+            plot_ax.set_ylabel("PSNR (dB)" if self.metric_key.lower() == 'psnr' else self.metric_display_name)
             plot_ax.set_title(title_text, fontsize=14)
             plot_ax.tick_params(axis='x', pad=6, labelsize=10)
             plot_ax.tick_params(axis='y', labelsize=10)
@@ -946,7 +1181,7 @@ class AsyncPsnrFeature:
             empty_text = plot_ax.text(
                 0.5,
                 0.5,
-                "Waiting for PSNR values...",
+                f"Waiting for {self.metric_display_name} values...",
                 ha='center',
                 va='center',
                 fontsize=12,
@@ -961,6 +1196,7 @@ class AsyncPsnrFeature:
             line_artists = {}
             legend_line_artists = {}
             legend_text_artists = {}
+            legend_box_artists = {}
             for method_name, legend_name, _y_arr, color in series_items:
                 line_obj, = plot_ax.plot([], [], linewidth=0.5, color=color, alpha=1.0, antialiased=True)
                 line_artists[method_name] = line_obj
@@ -974,6 +1210,7 @@ class AsyncPsnrFeature:
                 y_top = 1.0 - row * cell_h
                 y_bottom = y_top - cell_h
                 y_mid = (y_top + y_bottom) * 0.5
+
                 l_obj, = legend_ax.plot(
                     [x0 + 0.06 * cell_w, x0 + 0.25 * cell_w],
                     [y_mid, y_mid],
@@ -1043,7 +1280,7 @@ class AsyncPsnrFeature:
                 txt_obj.set_fontweight('bold' if is_hl else 'normal')
 
         ds_name = dataset_name if dataset_name else "N/A"
-        title_text = f"PSNR Curves on Dataset: {ds_name} (ref: {reference_key})"
+        title_text = f"{self.metric_display_name} Curves on Dataset: {ds_name} (ref: {reference_key})"
         if cache.get('title_text') != title_text:
             plot_ax.set_title(title_text, fontsize=14)
             cache['title_text'] = title_text
@@ -1149,39 +1386,36 @@ class AsyncPsnrFeature:
         return bgr, hitboxes, line_meta
 
     def _submit_render_request(self, request):
-        with self._render_lock:
-            if self._render_future is None:
-                fut = self._render_executor.submit(
-                    self._render_plot_image,
-                    request['ps'],
-                    request['pn'],
-                    request['pds'],
-                    request['pref'],
-                    request['frame_idx'],
-                    request['highlight'],
-                )
-                fut._psnr_request = request
-                self._render_future = fut
-            else:
-                self._render_staged_request = request
+        if self._render_future is None:
+            fut = self._render_executor.submit(
+                self._render_plot_image,
+                request['ps'],
+                request['pn'],
+                request['pds'],
+                request['pref'],
+                request['frame_idx'],
+                request['highlight'],
+            )
+            fut._psnr_request = request
+            self._render_future = fut
+        else:
+            self._render_staged_request = request
 
     def _pump_render_worker(self):
-        with self._render_lock:
-            fut = self._render_future
+        fut = self._render_future
         if fut is None or not fut.done():
             return
 
         try:
             image, hitboxes, line_meta = fut.result()
         except Exception as e:
-            log.warn(f"PSNR render failed: {e}")
+            log.warn(f"{self.metric_display_name} render failed: {e}")
             image, hitboxes, line_meta = None, [], None
 
-        with self._render_lock:
-            request = fut._psnr_request
-            self._render_future = None
-            staged = self._render_staged_request
-            self._render_staged_request = None
+        request = fut._psnr_request
+        self._render_future = None
+        staged = self._render_staged_request
+        self._render_staged_request = None
 
         if request is not None:
             self._plot_image_base = image
@@ -1208,29 +1442,37 @@ class AsyncPsnrFeature:
             'frame_idx': int(frame_idx),
             'highlight': highlight_payload,
         }
-        with self._render_lock:
-            if self._render_future is None:
-                fut = self._render_executor.submit(
-                    self._render_plot_image,
-                    request['ps'],
-                    request['pn'],
-                    request['pds'],
-                    request['pref'],
-                    request['frame_idx'],
-                    request['highlight'],
-                )
-                fut._psnr_request = request
-                self._render_future = fut
-            else:
-                self._render_staged_request = request
+        if self._render_future is None:
+            fut = self._render_executor.submit(
+                self._render_plot_image,
+                request['ps'],
+                request['pn'],
+                request['pds'],
+                request['pref'],
+                request['frame_idx'],
+                request['highlight'],
+            )
+            fut._psnr_request = request
+            self._render_future = fut
+        else:
+            self._render_staged_request = request
 
     def _loading_canvas(self):
         canvas = np.zeros((240, 640, 3), dtype=np.uint8)
-        cv2.putText(canvas, "Generating PSNR Panel...", (16, 120),
+        cv2.putText(canvas, f"Generating {self.metric_display_name} panel...", (16, 120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 220, 255), 2, lineType=cv2.LINE_AA)
         return canvas
 
     def _cancel_pending(self):
+        self._cancel_event.set()
+        enqueue_thread = self._enqueue_thread
+        self._enqueue_thread = None
+        if enqueue_thread is not None and enqueue_thread.is_alive():
+            try:
+                enqueue_thread.join(timeout=0.1)
+            except Exception:
+                pass
+        self._planned_tasks = None
         try:
             for fut in list(self._pending_futures.values()):
                 if fut is not None and not fut.done():
@@ -1238,84 +1480,34 @@ class AsyncPsnrFeature:
         except Exception:
             pass
         self._pending_futures = {}
-        with self._completion_signal_lock:
-            self._completed_signal_count = 0
-
-    def _start_async_compute(self):
-        self._cancel_pending()
-        token = self._build_cache_token()
-
-        image_files_snapshot = {
-            k: list(v) if isinstance(v, (list, tuple)) else []
-            for k, v in self.host.image_files.items()
-        }
-        ref_key_snapshot = self.host.reference_key
-        dataset_snapshot = self.host.dataset
-        ref_files = image_files_snapshot.get(ref_key_snapshot, [])
-        n = len(ref_files)
-        method_keys = [k for k in image_files_snapshot.keys() if k != ref_key_snapshot]
-
-        with self._lock:
-            self._values_dataset = dataset_snapshot
-            self._values_ref = ref_key_snapshot
-            self._values_n = n
-            self.values = {k: [np.nan] * n for k in method_keys}
-
-        self._pending_token = token
-        self._cache_token = token
-        self._dirty = True
-        self._last_refresh_ts = 0.0
-        self._completed_since_last_render = 0
-        self._plot_image = None
-        self._plot_image_base = None
-        self._plot_line_meta = None
-        self._legend_hitboxes = []
-
-        with self._lock:
-            ps = {k: list(v) for k, v in self.values.items()}
-            pn = int(self._values_n)
-            pds = self._values_dataset
-            pref = self._values_ref
-        self._request_render(ps, pn, pds, pref, int(self.host.current_frame), self._highlight_methods)
-
-        self._pending_futures = {}
-        for mk in method_keys:
-            mk_files = image_files_snapshot.get(mk, [])
-            limit = min(len(ref_files), len(mk_files))
-            for idx in range(limit):
-                fut = self._executor.submit(
-                    self._compute_one_psnr_task,
-                    token,
-                    mk,
-                    idx,
-                    ref_files[idx],
-                    mk_files[idx],
-                )
-                fut.add_done_callback(self._on_future_done)
-                self._pending_futures[(mk, idx)] = fut
+        self._completed_signal_count = 0
 
     def _ensure_plot_image(self):
         token = self._build_cache_token()
         now_ts = time.time()
         current_frame_idx = int(self.host.current_frame)
 
+        self._submit_planned_metric_tasks()
+
         self._pump_render_worker()
 
-        completed_count = 0
+        completed_count = self._completed_signal_count
+        self._completed_signal_count = 0
+
         for task_key, fut in list(self._pending_futures.items()):
             if not fut.done():
                 continue
             try:
-                done_token, done_method, done_index, value = fut.result()
-                if done_token == self._build_cache_token():
-                    with self._lock:
-                        series = self.values.get(done_method)
-                        if series is not None and 0 <= done_index < len(series):
-                            series[done_index] = value
-                            completed_count += 1
+                done_token, done_method, done_index, done_ok = fut.result()
+                if done_token != self._build_cache_token():
+                    continue
+                if not done_ok:
+                    log.warn(
+                        f"{self.metric_display_name} async task skipped/canceled for "
+                        f"{done_method}[{done_index}]"
+                    )
             except Exception as e:
-                log.warn(f"PSNR async compute failed for task {task_key}: {e}")
-                completed_count += 1
+                log.warn(f"{self.metric_display_name} async compute failed for task {task_key}: {e}")
 
         for task_key in [k for k, fut in self._pending_futures.items() if fut.done()]:
             self._pending_futures.pop(task_key, None)
@@ -1336,20 +1528,18 @@ class AsyncPsnrFeature:
         should_refresh_plot = force_refresh or data_changed
 
         if should_refresh_plot:
-            with self._lock:
-                ps = {k: list(v) for k, v in self.values.items()}
-                pn = int(self._values_n)
-                pds = self._values_dataset
-                pref = self._values_ref
+            ps = {k: list(v) for k, v in self.values.items()}
+            pn = int(self._values_n)
+            pds = self._values_dataset
+            pref = self._values_ref
             self._request_render(ps, pn, pds, pref, current_frame_idx, self._highlight_methods)
             self._last_refresh_ts = now_ts
 
             if self._completed_since_last_render > 0:
-                with self._completion_signal_lock:
-                    self._completed_signal_count = max(
-                        0,
-                        self._completed_signal_count - self._completed_since_last_render,
-                    )
+                self._completed_signal_count = max(
+                    0,
+                    self._completed_signal_count - self._completed_since_last_render,
+                )
                 self._completed_since_last_render = 0
         elif frame_changed and self._plot_image_base is not None:
             self._plot_image = self._compose_plot_with_frame_line(current_frame_idx)
@@ -1364,21 +1554,19 @@ class AsyncPsnrFeature:
             cv2.namedWindow(self.window_psnr)
             cv2.setMouseCallback(self.window_psnr, self._on_psnr_mouse)
             self._psnr_mouse_bound = True
-        with self._render_lock:
-            has_render_job = self._render_future is not None
+        has_render_job = self._render_future is not None
         if self._plot_image is not None:
             cv2.imshow(self.window_psnr, self._plot_image)
         elif self._pending_futures or has_render_job:
             cv2.imshow(self.window_psnr, self._loading_canvas())
+    #endregion
 
     def update(self):
         should_update = False
-        with self._completion_signal_lock:
-            if self._completed_signal_count > 0:
-                should_update = True
-        with self._render_lock:
-            if self._render_future is not None and self._render_future.done():
-                should_update = True
+        if self._completed_signal_count > 0:
+            should_update = True
+        if self._render_future is not None and self._render_future.done():
+            should_update = True
         if should_update:
             self.host.request_update()
 
@@ -1392,11 +1580,10 @@ class AsyncPsnrFeature:
 
     def on_shutdown(self, _host):
         self._cancel_pending()
-        with self._render_lock:
-            if self._render_future is not None and not self._render_future.done():
-                self._render_future.cancel()
-            self._render_future = None
-            self._render_staged_request = None
+        if self._render_future is not None and not self._render_future.done():
+            self._render_future.cancel()
+        self._render_future = None
+        self._render_staged_request = None
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
@@ -1405,13 +1592,66 @@ class AsyncPsnrFeature:
             self._render_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
+        try:
+            if self._metric_runner is not None and hasattr(self._metric_runner, 'shutdown'):
+                self._metric_runner.shutdown(wait=False)
+        except Exception:
+            pass
         self._psnr_jump_armed = False
         self._reset_mpl_cache()
         self._psnr_mouse_bound = False
 
 
-def install_default_psnr_feature(host):
-    return AsyncPsnrFeature(host, refresh_interval_sec=0.5, max_workers=16)
+class _FeatureBundle:
+    def __init__(self, features):
+        self.features = [f for f in (features or []) if f is not None]
+
+    def update(self):
+        for f in self.features:
+            try:
+                f.update()
+            except Exception:
+                pass
+
+
+def install_default_metrics_feature(host, metric_types='psnr', max_workers=16, threads_per_methods=4):
+    if isinstance(metric_types, str):
+        metric_list = [m.strip() for m in metric_types.replace(',', ' ').split() if m.strip()]
+    else:
+        metric_list = [str(m).strip() for m in (metric_types or []) if str(m).strip()]
+    if not metric_list:
+        metric_list = ['psnr']
+
+    log.info(f"Registered metric feature for {', '.join(metric_list)} with max_workers={max_workers} and threads_per_methods={threads_per_methods}")
+
+    shared_metric_runner = None
+    if _IQAs is not None:
+        try:
+            shared_metric_runner = _IQAs(
+                *metric_list,
+                device='cpu',
+                traditional=True,
+            )
+        except Exception:
+            traceback.print_exc()
+            shared_metric_runner = None
+
+    shared_metric_cache = {}
+    setattr(host, '_metric_feature_cache', shared_metric_cache)
+
+    features = [
+        AsyncMetricFeature(
+            host,
+            refresh_interval_sec=0.5,
+            max_workers=max_workers,
+            metric_type=mt,
+            threads_per_methods=threads_per_methods,
+            metric_runner=shared_metric_runner,
+            metric_result_cache=shared_metric_cache,
+        )
+        for mt in metric_list
+    ]
+    return _FeatureBundle(features)
 
 
 class InteractiveCropComparator:
@@ -1434,7 +1674,7 @@ class InteractiveCropComparator:
             current_group=None,
             current_dataset=None,
             method_roots=None,
-                event_on_init=None,
+            event_on_init=None,
     ):
         self.input_folders = input_folders
         self.output_folder = output_folder
@@ -1501,7 +1741,7 @@ class InteractiveCropComparator:
         self.window_main = "Crop Controller"
         self.window_grid = "Crop Grid"
         self.window_final = "Final Layout"
-        self.window_psnr = "PSNR Curves"
+        self.window_psnr = "Metric Curves"
 
         self.dragging = False
         self.mode = 'idle'  # 'selection' | 'position' | 'idle'
@@ -1682,19 +1922,28 @@ class InteractiveCropComparator:
                     self.group = inferred_group
             except Exception:
                 pass
-        print(f"Inferred dataset: {log.style_key(self.dataset)}, group: {log.style_key(self.group)} from input paths.")
+        log.info(f"Inferred dataset: {log.style_key(self.dataset)}, group: {log.style_key(self.group)} from input paths.")
 
         self._refresh_method_grid_sorting()
-        if callable(event_on_init):
-            try:
-                feature_obj = event_on_init(self)
-                if hasattr(feature_obj, 'update') and callable(feature_obj.update):
-                    self.register_event_handler(
-                        'loop_tick',
-                        lambda _host, _feature=feature_obj: _feature.update(),
-                    )
-            except Exception as e:
-                log.warn(f"event_on_init execution failed: {e}")
+        self._event_on_init = event_on_init if callable(event_on_init) else None
+        self._event_on_init_done = False
+
+    def _try_runtime_event_init(self):
+        """Initialize optional runtime features once, after the first frame is shown."""
+        if self._event_on_init_done or self._event_on_init is None:
+            return
+
+        self._event_on_init_done = True
+        try:
+            feature_obj = self._event_on_init(self)
+            if hasattr(feature_obj, 'update') and callable(feature_obj.update):
+                self.register_event_handler(
+                    'loop_tick',
+                    lambda _host, _feature=feature_obj: _feature.update(),
+                )
+        except Exception as e:
+            log.error(f"event_on_init execution failed: {e}")
+            traceback.print_exc()
 
     def register_event_handler(self, event_name, handler):
         if not event_name or not callable(handler):
@@ -1707,7 +1956,8 @@ class InteractiveCropComparator:
             try:
                 h(self)
             except Exception as e:
-                log.warn(f"Event handler failed for {event_name}: {e}")
+                log.error(f"Event handler failed for {event_name}: {e}")
+                traceback.print_exc()
 
     def _infer_method_root(self, src, files):
         """Best-effort method root inference for rebuild_dataset support."""
@@ -1719,11 +1969,8 @@ class InteractiveCropComparator:
             if len(parts) >= 2:
                 return os.path.dirname(path)
         if files:
-            try:
-                common = os.path.commonpath(files)
-                return os.path.dirname(common)
-            except Exception:
-                return None
+            common = os.path.commonpath(files)
+            return os.path.dirname(common)
         return None
 
     # ---- Undo helpers ----
@@ -2085,19 +2332,12 @@ class InteractiveCropComparator:
         return grid_rgb
 
     @staticmethod
-    def _grid_text_style(display_scale, scale_divisor=1.0):
-        try:
-            scale_for_text = float(display_scale)
-            if scale_divisor > 0:
-                scale_for_text = scale_for_text / float(scale_divisor)
-            if scale_for_text <= 0:
-                scale_for_text = 1.0
-        except Exception:
-            scale_for_text = 1.0
-        safe_scale = max(scale_for_text, 0.01)
-        text_scale = 0.5 / safe_scale
-        text_thickness = max(1, int(round(1 / safe_scale)))
-        text_y = max(15, int(round(15 / safe_scale)))
+    def _grid_text_style(display_scale):
+        safe_scale = max(display_scale, 0.01)
+
+        text_scale = 0.35 * safe_scale
+        text_thickness = max(1, int(round(0.5 * safe_scale)))
+        text_y = max(8, int(round(12 * safe_scale)))
         return text_scale, text_thickness, text_y
 
     def _darken_color(self, color, steps):
@@ -2197,10 +2437,7 @@ class InteractiveCropComparator:
         self.mode = 'selection'
         # Close all existing grid windows before clearing the set
         for w in list(self.grid_windows):
-            try:
-                cv2.destroyWindow(w)
-            except Exception:
-                pass
+            cv2.destroyWindow(w)
         self.grid_windows = set()
         self.add_roi()
         self._emit_event('on_rebuild_dataset')
@@ -2214,17 +2451,11 @@ class InteractiveCropComparator:
     # ---- Grid ordering helpers ----
     @staticmethod
     def _is_input_key(key):
-        try:
-            return str(key).lower() == 'input'
-        except Exception:
-            return False
+        return str(key).lower() == 'input'
 
     @staticmethod
     def _is_gt_key(key):
-        try:
-            return str(key).lower() == 'gt'
-        except Exception:
-            return False
+        return str(key).lower() == 'gt'
 
     def _refresh_method_grid_sorting(self):
         """If every method folder contains a .srt file, use its stem for grid sorting."""
@@ -2244,6 +2475,7 @@ class InteractiveCropComparator:
                 ]
                 return _natsorted(files)
             except Exception:
+                traceback.print_exc()
                 return []
 
         def _method_dir_from_src(method_key, src_path):
@@ -2315,7 +2547,7 @@ class InteractiveCropComparator:
                      f"{', '.join(f'{log.style_path(k)}->{v}' for k, v in self._method_srt_stems.items())}")
         else:
             missing = [k for k in methods if k not in self._method_srt_stems]
-            log.warn(f"Not all methods have `.srt` files. Methods missing `.srt` files: {', '.join(log.style_path(k) for k in missing)}")
+            log.info(f"Not all methods have `.srt` files. Methods missing `.srt` files: {', '.join(log.style_path(k) for k in missing)}")
         self._all_methods_have_srt = bool(all_have and len(self._method_srt_stems) == len(methods))
 
     def _ordered_method_keys_for_grid(self):
@@ -2873,11 +3105,9 @@ class InteractiveCropComparator:
 
         grid_rgb, grid_alpha, _bg_color = self._new_grid_canvas(grid_h, grid_w)
 
-        base_text_scale, base_text_thickness, base_text_y = self._grid_text_style(1.0)
-        full_scale = max(0.01, self.full_image_scale)
-        text_scale = base_text_scale * full_scale
-        text_thickness = max(1, int(round(base_text_thickness * full_scale)))
-        text_y = max(8, int(round(base_text_y * full_scale)))
+        ada_scale = max_w / 100
+        full_scale = max(0.01, self.full_image_scale) * ada_scale
+        text_scale, text_thickness, text_y = self._grid_text_style(full_scale)
         label_color = (0, 255, 0)
 
         for i, img in enumerate(images):
@@ -3325,10 +3555,7 @@ class InteractiveCropComparator:
 
         if self.mode == 'idle':
             for w in list(self.grid_windows):
-                try:
-                    cv2.destroyWindow(w)
-                except Exception:
-                    pass
+                cv2.destroyWindow(w)
             self.grid_windows.clear()
             self._cached_grid_views = {}
             self._cached_final_view = None
@@ -3381,10 +3608,7 @@ class InteractiveCropComparator:
                 # Destroy windows no longer needed
                 obsolete = self.grid_windows - needed
                 for w in obsolete:
-                    try:
-                        cv2.destroyWindow(w)
-                    except Exception:
-                        pass
+                    cv2.destroyWindow(w)
                 self.grid_windows = needed
 
                 if self._cached_final_view is None:
@@ -3394,26 +3618,25 @@ class InteractiveCropComparator:
                     cv2.imshow(self.window_final, self._cached_final_view)
 
         if self.show_all_method_images:
-            if allow_secondary_update:
-                full_grid = self.build_full_image_grid()
-                if full_grid is None:
-                    blank = final_layout_blank()
-                    cv2.imshow(self.method_full_image_window, blank)
-                else:
-                    display_scale = float(self.full_image_scale or 0.5)
-                    if display_scale <= 0:
-                        display_scale = 0.5
-                    if display_scale != 1.0:
-                        full_grid = cv2.resize(
-                            full_grid,
-                            dsize=None,
-                            fx=display_scale,
-                            fy=display_scale,
-                            interpolation=cv2.INTER_NEAREST,
-                        )
-                    if full_grid.ndim == 3 and full_grid.shape[2] == 4:
-                        full_grid = cv2.cvtColor(full_grid, cv2.COLOR_BGRA2BGR)
-                    cv2.imshow(self.method_full_image_window, full_grid)
+            full_grid = self.build_full_image_grid()
+            if full_grid is None:
+                blank = final_layout_blank()
+                cv2.imshow(self.method_full_image_window, blank)
+            else:
+                display_scale = float(self.full_image_scale or 0.5)
+                if display_scale <= 0:
+                    display_scale = 0.5
+                if display_scale != 1.0:
+                    full_grid = cv2.resize(
+                        full_grid,
+                        dsize=None,
+                        fx=display_scale,
+                        fy=display_scale,
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                if full_grid.ndim == 3 and full_grid.shape[2] == 4:
+                    full_grid = cv2.cvtColor(full_grid, cv2.COLOR_BGRA2BGR)
+                cv2.imshow(self.method_full_image_window, full_grid)
         else:
             try:
                 cv2.destroyWindow(self.method_full_image_window)
@@ -3453,6 +3676,7 @@ class InteractiveCropComparator:
             return True
         except Exception as e:
             log.error(f"Failed to save ROI info: {e}")
+            traceback.print_exc()
             return False
 
     def load_rois_from_txt(self, path):
@@ -3612,6 +3836,7 @@ class InteractiveCropComparator:
                 cv2.imwrite(grid_all_out, grid_all)
         except Exception as e:
             log.warn(f"Failed to save grid images: {e}")
+            traceback.print_exc()
         try:
             ref_file = self.image_files[self.reference_key][self.current_frame]
             ref_stem = os.path.basename(ref_file).rsplit('.', 1)[0]
@@ -3626,39 +3851,47 @@ class InteractiveCropComparator:
         cv2.setMouseCallback(self.window_main, self.on_mouse)
         self.save_label = pair
 
-        log.banner("Interactive Crop Comparator")
+        ACTION_WIDTH = 7 + 2
+        log.banner("Interactive Crop Comparator", level=1)
         log.info(f"Mouse: selection mode to draw rect; position mode to move")
         log.info(
-            "Keys: "
-            + f"{log.style_key('a')} add next ROI, "
+            f"[{'Basic':^{ACTION_WIDTH}}] action: "
+            + f"{log.style_key('a')} {log.style_underline('a')}dd next ROI, "
             + f"{log.style_key('1-9')} add/select ROI id; press same id to enter selection mode, "
-            + f"{log.style_key('Shift+1-9')} duplicate to id or copy size (see README), "
-            + f"{log.style_key('d')} add new ROI with active size, "
+            + f"{log.style_key('d')} {log.style_underline('d')}uplicate new ROI with active size, "
             + f"{log.style_key('Del')} delete active ROI"
         )
         log.info(
-            "Arrow keys (switch final layout on the fly): "
+            f"[{'Status':^{ACTION_WIDTH}}] action: "
+            + f"{log.style_key('[')}/{log.style_key('p')} {log.style_underline('p')}rev image, "
+            + f"{log.style_key(']')}/{log.style_key('n')} {log.style_underline('n')}ext image, "
+            + f"{log.style_key('s')} {log.style_underline('s')}ave outputs, "
+            + f"{log.style_key('q')}/{log.style_key('Esc')} {log.style_underline('q')}uit"
+        )
+        log.info(
+            f"[{'Advance':^{ACTION_WIDTH}}] action: "
+            + f"{log.style_key('+')}/{log.style_key('=')} zoom in, "
+            + f"{log.style_key('-')}/{log.style_key('_')} zoom out, "
+            + f"{log.style_key('r')} clear all rois, "
+            + f"{log.style_key('z')} undo, "
+            + f"{log.style_key('y')} redo"
+        )
+        log.info(
+            f"[{'Layout':^{ACTION_WIDTH}}] action: "
             + f"{log.style_key('←')} {log.style_mode('left')} (crops stack left), "
             + f"{log.style_key('↑')} {log.style_mode('top')} (crops stack above), "
             + f"{log.style_key('→')} {log.style_mode('right')} (crops stack right), "
             + f"{log.style_key('↓')} {log.style_mode('bottom')} (crops stack below)"
         )
         log.info(
-            "Other: "
-            + f"{log.style_key('[')}/{log.style_key('p')} prev image, "
-            + f"{log.style_key(']')}/{log.style_key('n')} next image, "
-            + f"{log.style_key('Tab')} show/hide all method full-image grid, "
-            + f"{log.style_key('+')}/{log.style_key('=')} zoom in, "
-            + f"{log.style_key('-')}/{log.style_key('_')} zoom out, "
-            + f"{log.style_key('s')} save outputs, "
-            + f"{log.style_key('i')} idle toggle, "
-            + f"{log.style_key('r')} clear all rois, "
-            + f"{log.style_key('z')} undo, "
-            + f"{log.style_key('y')} redo, "
+            f"[{'Extra':^{ACTION_WIDTH}}] action: "
+            + f"{log.style_key('Tab')} show/hide all method full-image grid, "   # Tab 需要按下两次才能执行相关操作，原因是 Tab 和窗口的某个操作冲突了，暂时没找到解决方法
+            + f"{log.style_key('i')} {log.style_underline('i')}dle toggle, "
+            + f"{log.style_key('Shift+1-9')} duplicate to id or copy size (see README), "
             + f"{log.style_key('Enter')} switch dataset/group, "
-            + f"{log.style_key('Space')} jump to image, "
-            + f"{log.style_key('q')}/{log.style_key('Esc')} quit"
+            + f"{log.style_key('Space')} jump to image"
         )
+        log.banner("Logs", level=2)
         # Default: enter ROI 1 selection mode at startup
         if len(self.rois) == 0:
             self.add_roi()
@@ -3672,9 +3905,10 @@ class InteractiveCropComparator:
 
         exit_keys = {ord('q'), 27}
 
+        self._try_runtime_event_init()
         while True:
             keys = []
-            first_key = cv2.waitKeyEx(10)
+            first_key = cv2.waitKeyEx(1)
             if first_key >= 0:
                 keys.append(_normalize_key(first_key))
                 # Drain queued key events so all commands execute before one render.
@@ -3685,6 +3919,7 @@ class InteractiveCropComparator:
                     keys.append(_normalize_key(k))
 
             if any(k in exit_keys for k in keys):
+                log.info("Quitting.")
                 break
 
             if keys:
@@ -3694,11 +3929,8 @@ class InteractiveCropComparator:
                 now_ts = time.time()
                 layout_idle = (now_ts - float(self._last_input_activity_ts)) >= float(self._layout_debounce_sec)
                 if layout_idle:
-                    try:
-                        if self._cached_layout_signature != self._layout_state_signature():
-                            self.request_update()
-                    except Exception:
-                        pass
+                    if self._cached_layout_signature != self._layout_state_signature():
+                        self.request_update()
 
             for key in keys:
                 handled = self.dispatcher.dispatch(key)
@@ -3806,8 +4038,6 @@ if __name__ == "__main__":
         title='Interaction & Grid View',
         description='Interaction mode and per-ROI grid visualization settings (columns, gap, magnification).'
     )
-    g_view.add_argument('--mode', '-m', default='selection', type=str, choices=['selection', 'position', 'idle'],
-                        help='Startup interaction mode: selection (draw), position (move), or idle (hide grids).')
     g_view.add_argument('--columns', '-c', default=None, type=lambda x: int(x) if x else None,
                         help='Number of columns in the per-ROI method grid view (rows are computed automatically). If not specified and there are >=9 methods, auto-computed as (num_methods+1)//2.')
     g_view.add_argument('--grid-gap', default=2, type=int,
@@ -3859,6 +4089,16 @@ if __name__ == "__main__":
                        help='Disable ANSI colored logs (use plain text).')
     g_log.add_argument('--log-level', default='info', choices=['debug', 'info', 'warn', 'error'],
                        help='Logging level: debug|info|warn|error (default: info).')
+
+    # --- Metrics curve panel ---
+    g_metric = parser.add_argument_group(
+        title='Metric Curves',
+        description='Configure asynchronous metric-curve windows. Multiple metrics create multiple windows.'
+    )
+    g_metric.add_argument('--metrics', '-m', default='psnr', type=str,
+                          help='Comma/space separated metric types (e.g., "psnr", "ssim,lpips", "niqe").')
+    g_metric.add_argument('--metric-methods', default=8, type=int,
+                          help='Worker threads per method (default: 8).')
     args = parser.parse_args()
 
     output_abs = os.path.abspath(args.output)
@@ -3880,10 +4120,7 @@ if __name__ == "__main__":
             raise ValueError("methods.txt is required for external source")
         methods, removed = _apply_exclude(methods, exclude_methods)
         if removed:
-            try:
-                log.info(f"Excluded methods: {removed}")
-            except Exception:
-                pass
+            log.info(f"Excluded methods: {removed}")
         if not methods:
             raise ValueError("No methods left after applying --exclude")
         input_folder = {m: f"/data/user/results/{m}/{dataset}/pred/{pair}" for m in methods}
@@ -3923,26 +4160,17 @@ if __name__ == "__main__":
                     discovered.append(d)
                 methods = discovered
                 if skipped:
-                    try:
-                        log.debug(f"Skipped output folder(s) while auto-discovering methods: {skipped}")
-                    except Exception:
-                        pass
+                    log.debug(f"Skipped output folder(s) while auto-discovering methods: {skipped}")
             except Exception:
                 methods = []
-        try:
-            log.info(f"Visualizing methods: {methods}")
-        except Exception:
-            pass
+        log.info(f"Visualizing methods: {methods}")
 
         if not methods:
             raise ValueError(f"No methods found under root {args.root}; please specify methods.txt or add method folders.")
 
         methods, removed = _apply_exclude(methods, exclude_methods)
         if removed:
-            try:
-                log.info(f"Excluded methods: {removed}")
-            except Exception:
-                pass
+            log.info(f"Excluded methods: {removed}")
         if not methods:
             raise ValueError("No methods left after applying --exclude")
 
@@ -3972,11 +4200,8 @@ if __name__ == "__main__":
                 raise ValueError(f"Folder {source} has no images (png/jpg/jpeg)")
 
     # configure logger
-    try:
-        log.set_color_enabled(not args.no_color)
-        log.set_level(args.log_level)
-    except Exception:
-        pass
+    log.set_color_enabled(not args.no_color)
+    log.set_level(args.log_level)
 
     # Parse layout background color CSV (R,G,B[,A]) or "transparent"
     try:
@@ -4005,9 +4230,13 @@ if __name__ == "__main__":
         compose_layout=args.compose_layout,
         current_group=args.group,
         current_dataset=dataset,
-        event_on_init=install_default_psnr_feature,
+        event_on_init=lambda host: install_default_metrics_feature(
+            host,
+            metric_types=args.metrics,
+            max_workers=os.cpu_count(),
+            threads_per_methods=os.cpu_count() if args.metric_methods is None else args.metric_methods,
+        ),
     )
-    comparator.mode = args.mode
     comparator.layout_mode = args.layout
     comparator.single_crop_position = args.single_crop_position
     comparator.preview_key = args.preview or ('GT' if 'GT' in input_folder else (
@@ -4056,6 +4285,7 @@ if __name__ == "__main__":
         if shared_layout:
             log.note("Detected shared layout (image-id folders containing per-method files)")
     except Exception:
+        traceback.print_exc()
         pass
     # Use dataset as label for saving in local mode; pair+dataset for external
     label_pair = pair if args.source == 'external' else dataset
