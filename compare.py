@@ -1671,6 +1671,7 @@ class InteractiveCropComparator:
             layout_min_scale=1.0,
             layout_use_alpha: bool = False,
             compose_layout: bool = True,
+            save_selection_image: bool = False,
             current_group=None,
             current_dataset=None,
             method_roots=None,
@@ -1823,6 +1824,7 @@ class InteractiveCropComparator:
         self.preview_key = reference_key
         self.single_crop_position = 'auto'
         self.compose_layout = bool(compose_layout)
+        self.save_selection_image = bool(save_selection_image)
         self.show_all_method_images = False
         self.save_session_ts = None
         self.undo_manager = UndoManager()
@@ -3133,7 +3135,7 @@ class InteractiveCropComparator:
 
         return self._finalize_grid_canvas(grid_rgb, grid_alpha)
 
-    def build_final_layout_for_key(self, key, sort_mode=None, reverse_sort=False):
+    def build_final_layout_for_key(self, key, sort_mode=None, reverse_sort=False, include_outer_crop=True):
         ref = self.read_frame(key, self.current_frame)
         if ref is None:
             return None
@@ -3167,8 +3169,40 @@ class InteractiveCropComparator:
         if len(valid) == 0:
             return None
         block_line_th = max(1, int(round(self.line_thickness * self.layout_border_scale)))
-        # Single ROI: overlay inside at the mirrored position
-        if len(valid) == 1:
+
+        def _norm_single_pos(raw_pos: str):
+            if raw_pos is None:
+                return 'auto'
+            s = str(raw_pos).strip().lower()
+            if not s or s == 'auto':
+                return 'auto'
+            mapping = {
+                'outer': 'outer',
+                'tl': 'tl',
+                'top-left': 'tl',
+                'left-top': 'tl',
+                'upper-left': 'tl',
+                'tr': 'tr',
+                'top-right': 'tr',
+                'right-top': 'tr',
+                'upper-right': 'tr',
+                'bl': 'bl',
+                'bottom-left': 'bl',
+                'left-bottom': 'bl',
+                'lower-left': 'bl',
+                'br': 'br',
+                'bottom-right': 'br',
+                'right-bottom': 'br',
+                'lower-right': 'br',
+            }
+            return mapping.get(s, 'auto')
+
+        pos = _norm_single_pos(self.single_crop_position) if len(valid) == 1 else 'auto'
+
+        # Single ROI: keep the dedicated in-image placement path unless the user
+        # explicitly requested outer layout, in which case we fall through to the
+        # multi-ROI composition branch below with a single crop.
+        if len(valid) == 1 and not (pos == 'outer' and include_outer_crop):
             rid, r0 = valid[0]
             rect = r0['rect']
             x1, y1, x2, y2 = self.clamp_rect(rect)
@@ -3182,47 +3216,27 @@ class InteractiveCropComparator:
             if crop.size == 0:
                 return ref.copy()
             gh, gw = crop.shape[:2]
-            # Scale with display_scale but clamp to fit canvas
+            # Scale with display_scale; outer mode is allowed to expand the canvas.
             dscale = self.display_scale if hasattr(self, 'display_scale') and self.display_scale > 0 else 1.0
-            scale = min(dscale, min(W / max(gw, 1), H / max(gh, 1)))
+            scale = dscale
+            if self.single_crop_position != 'outer':
+                scale = min(dscale, min(W / max(gw, 1), H / max(gh, 1)))
             if scale != 1.0:
                 crop = cv2.resize(crop, dsize=None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
                 gh, gw = crop.shape[:2]
-            # place at the nearest corner to mirrored center
+            # place at the nearest corner to mirrored center, or outside the image for outer mode
             corners = [(0, 0), (W - gw, 0), (0, H - gh), (W - gw, H - gh)]
-
-            def _norm_single_pos(raw_pos: str):
-                if raw_pos is None:
-                    return 'auto'
-                s = str(raw_pos).strip().lower()
-                if not s or s == 'auto':
-                    return 'auto'
-                mapping = {
-                    'tl': 'tl',
-                    'top-left': 'tl',
-                    'left-top': 'tl',
-                    'upper-left': 'tl',
-                    'tr': 'tr',
-                    'top-right': 'tr',
-                    'right-top': 'tr',
-                    'upper-right': 'tr',
-                    'bl': 'bl',
-                    'bottom-left': 'bl',
-                    'left-bottom': 'bl',
-                    'lower-left': 'bl',
-                    'br': 'br',
-                    'bottom-right': 'br',
-                    'right-bottom': 'br',
-                    'lower-right': 'br',
-                }
-                return mapping.get(s, 'auto')
 
             def dist2(ax, ay, bx, by):
                 dx = ax - bx
                 dy = ay - by
                 return dx * dx + dy * dy
 
-            pos = _norm_single_pos(self.single_crop_position)
+            if pos == 'outer':
+                out = ref.copy()
+                color = self._color_with_alpha(r0['color'])
+                cv2.rectangle(out, (x1, y1), (x2, y2), color, self.line_thickness)
+                return out
             if pos == 'tl':
                 x0, y0 = 0, 0
             elif pos == 'tr':
@@ -3779,6 +3793,17 @@ class InteractiveCropComparator:
             else:
                 log.warn(f"Final layout for {m}{m_suffix} is empty; skipping")
 
+            if self.save_selection_image and len([r for r in self.rois.values() if r.get('rect') is not None]) == 1:
+                selection_only = self.build_final_layout_for_key(
+                    m,
+                    sort_mode=self.sort_mode,
+                    reverse_sort=self.sort_reverse,
+                    include_outer_crop=False,
+                )
+                if selection_only is not None:
+                    selection_out = os.path.join(m_dir, f"selection_{m}{m_suffix}.png")
+                    cv2.imwrite(selection_out, selection_only)
+
             # Save each ROI crop for this method
             for rid, r in sorted(self.rois.items()):
                 rect = r.get('rect')
@@ -4068,7 +4093,7 @@ if __name__ == "__main__":
                           help='Padding/background color as R,G,B[,A] for final layout gaps, or "transparent" (default). e.g., 0,0,0 or 255,255,255,255.')
     g_layout.add_argument('--single-crop-position', default='auto', type=str,
                             help='When there is only 1 ROI/crop, control where that crop is placed in the final layout. '
-                                 'Supported: auto (default), tl/tr/bl/br, top-left/top-right/bottom-left/bottom-right.')
+                               'Supported: auto (default), outer, tl/tr/bl/br, top-left/top-right/bottom-left/bottom-right.')
 
     # --- ROI / drawing ---
     g_roi = parser.add_argument_group(
@@ -4079,6 +4104,8 @@ if __name__ == "__main__":
                        help='Line thickness for ROI boxes and crop borders (default: 2; minimum: 1).')
     g_roi.add_argument('--roi-file', default=None, type=str,
                        help='Optional ROI txt file to preload; format per line: id x1 y1 x2 y2.')
+    g_roi.add_argument('--save-selection-image', action='store_true',
+                       help='When saving outputs, also save a selection-only image without the outer crop for single-ROI outer layouts.')
 
     # --- Logging ---
     g_log = parser.add_argument_group(
@@ -4228,6 +4255,7 @@ if __name__ == "__main__":
         layout_gap=args.layout_gap,
         layout_bg_color=layout_bg_color,
         compose_layout=args.compose_layout,
+        save_selection_image=args.save_selection_image,
         current_group=args.group,
         current_dataset=dataset,
         event_on_init=lambda host: install_default_metrics_feature(
